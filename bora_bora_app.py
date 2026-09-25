@@ -16,8 +16,23 @@ from io import BytesIO
 import bora_bora_data as data
 import bora_bora_engine as eng
 
-st.set_page_config(page_title="Bora Bora Capacity Planner", layout="wide", page_icon="🌴")
-st.title("🌴 Bora Bora Net-Zero Capacity Expansion Planner")
+st.set_page_config(page_title="Bora Bora Net Zero Optimization", layout="wide")
+
+st.markdown("""
+<div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:4px">
+    <svg width="52" height="52" viewBox="0 0 52 52" xmlns="http://www.w3.org/2000/svg">
+        <rect width="52" height="52" rx="0" fill="#0047AB"/>
+        <text x="18" y="38" font-family="Arial,sans-serif" font-size="32"
+              font-weight="bold" fill="white" text-anchor="middle">S</text>
+        <text x="36" y="37" font-family="Arial,sans-serif" font-size="18"
+              font-weight="bold" fill="white" text-anchor="middle">J</text>
+        <circle cx="38" cy="18" r="4" fill="#E63946"/>
+    </svg>
+    <p style="font-size:2.5rem;font-weight:bold;color:#1f77b4;margin:0">
+        Bora Bora Net Zero Optimization
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
 # ==============================================================================
 # SIDEBAR
@@ -26,8 +41,8 @@ with st.sidebar:
 
     # --- PV -------------------------------------------------------------
     with st.expander("☀️ Solar PV", expanded=True):
-        pv_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV)", type=["csv"], key="pv_upload")
-        st.download_button("Download current profile", data.pv_cf_default_csv(), "pv_cf.csv", key="pv_tmpl")
+        pv_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV) - required", type=["csv"], key="pv_upload")
+        st.download_button("Download blank template", data.pv_cf_template_csv(), "pv_cf_template.csv", key="pv_tmpl")
         dc_ac_ratio = st.number_input("DC:AC ratio", value=1.3, step=0.05)
         pv_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.3, step=0.1)
 
@@ -37,9 +52,9 @@ with st.sidebar:
         wind_mw = st.number_input("Capacity (MW)", value=4.125, step=0.1, disabled=not wind_enabled)
         wind_commissioning_year = st.number_input("Commissioning year", value=2028, step=1, disabled=not wind_enabled)
         wind_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.5, step=0.1, disabled=not wind_enabled)
-        wind_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV)", type=["csv"],
+        wind_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV) - required if wind is included", type=["csv"],
                                            key="wind_upload", disabled=not wind_enabled)
-        st.download_button("Download current profile", data.wind_cf_default_csv(), "wind_cf.csv", key="wind_tmpl")
+        st.download_button("Download blank template", data.wind_cf_template_csv(), "wind_cf_template.csv", key="wind_tmpl")
 
     # --- OTEC -------------------------------------------------------------
     with st.expander("🌊 OTEC", expanded=True):
@@ -60,10 +75,10 @@ with st.sidebar:
     with st.expander("🏝️ Demand — existing development (baseline)", expanded=False):
         st.caption("Shape = one full 8,760-hour reference year (the pattern). "
                    "Annual table = each year's total MWh (the multiplier applied to the shape).")
-        baseline_shape_upload = st.file_uploader("Hourly demand shape, one calendar year (CSV)", type=["csv"], key="baseline_upload")
-        st.download_button("Download current shape", data.baseline_demand_default_csv(), "baseline_demand.csv", key="baseline_tmpl")
-        annual_table_upload = st.file_uploader("Annual demand by year (CSV)", type=["csv"], key="annual_upload")
-        st.download_button("Download current table", data.annual_table_default_csv(), "annual_demand.csv", key="annual_tmpl")
+        baseline_shape_upload = st.file_uploader("Hourly demand shape, one calendar year (CSV) - required", type=["csv"], key="baseline_upload")
+        st.download_button("Download blank template", data.baseline_demand_template_csv(), "baseline_demand_template.csv", key="baseline_tmpl")
+        annual_table_upload = st.file_uploader("Annual demand by year (CSV) - optional, falls back to the bundled Forecast_Annual figures below", type=["csv"], key="annual_upload")
+        st.download_button("Download current table (bundled default)", data.annual_table_default_csv(), "annual_demand.csv", key="annual_tmpl")
 
     # --- Demand: EV chargers (land, excl. bus) ---------------------------------------------
     with st.expander("🔌 Demand — EV chargers (land, excl. bus)", expanded=False):
