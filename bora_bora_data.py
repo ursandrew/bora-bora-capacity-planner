@@ -41,6 +41,18 @@ def _pick_column(row, candidates):
     raise KeyError(f"None of the expected columns {candidates} found in {list(row.keys())}")
 
 
+def _to_float(value):
+    """Converts a CSV cell to float, tolerating formatting Excel commonly
+    applies when saving/exporting numbers as text: thousands-separator
+    commas ("44,178.00"), surrounding whitespace, and a trailing/leading
+    currency symbol."""
+    s = str(value).strip()
+    if s == "":
+        return 0.0
+    s = s.replace(",", "").replace("$", "").strip()
+    return float(s)
+
+
 # ---------------------------------------------------------------------------
 # Hourly (8760-row) capacity-factor / demand-shape series
 # ---------------------------------------------------------------------------
@@ -56,7 +68,7 @@ def load_hourly_series(source, value_columns, label):
     if not rows:
         raise ValueError("File has no data rows.")
     col = _pick_column(rows[0], value_columns)
-    series = [float(r[col]) for r in rows]
+    series = [_to_float(r[col]) for r in rows]
     if len(series) != HOURS_PER_YEAR:
         raise ValueError(f"Expected {HOURS_PER_YEAR} hourly rows, got {len(series)}.")
     return series
@@ -101,7 +113,7 @@ def load_annual_table(source, default_table, year_col="year", value_col="mwh"):
     rows = _read_rows(source, None)
     table = {}
     for r in rows:
-        table[int(float(r[year_col]))] = float(r[value_col])
+        table[int(_to_float(r[year_col]))] = _to_float(r[value_col])
     return table
 
 
@@ -154,22 +166,21 @@ def load_day_profiles_by_year(source):
     by_year = {}
     for yc in year_cols:
         try:
-            year = int(float(yc))
+            year = int(_to_float(yc))
         except ValueError:
             continue  # skip any non-year column (e.g. a label column)
         by_year[year] = [0.0] * 24
 
     for r in rows:
-        hour = int(float(r[hour_col]))
+        hour = int(_to_float(r[hour_col]))
         if not (0 <= hour <= 23):
             raise ValueError(f"Hour value {hour} is out of range 0-23.")
         for yc in year_cols:
             try:
-                year = int(float(yc))
+                year = int(_to_float(yc))
             except ValueError:
                 continue
-            val = r.get(yc, "")
-            by_year[year][hour] = float(val) if str(val).strip() != "" else 0.0
+            by_year[year][hour] = _to_float(r.get(yc, ""))
 
     if any(len(v) != 24 for v in by_year.values()):
         raise ValueError("Every year column must have all 24 hours (0-23) populated.")
@@ -211,7 +222,7 @@ def load_single_day_shape(source):
     rows = _read_rows(source, None)
     profile = [0.0] * 24
     for r in rows:
-        profile[int(float(r["hour"]))] = float(r["mw"])
+        profile[int(_to_float(r["hour"]))] = _to_float(r["mw"])
     return profile
 
 
