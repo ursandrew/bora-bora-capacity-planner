@@ -132,21 +132,44 @@ def lookup_annual(table, year, growth_rate_beyond_last=0.0):
 # ---------------------------------------------------------------------------
 
 def load_day_profiles_by_year(source):
-    """Long-format CSV: columns year, hour, mw (hour = 0..23).
-    Returns {year: [24 floats]}. Returns {} if source is None (i.e. no
-    EV/marine load modeled until a profile is supplied)."""
+    """Wide-format CSV, same layout as the Combined_Hourly_Load sheet:
+    first column is the hour of day (0-23), every other column header is a
+    calendar year, and each cell is that year's MW value for that hour -
+    one representative day per year, which gets repeated for every day of
+    that year. Returns {year: [24 floats]}, keyed by the year column headers
+    present. Returns {} if source is None (no load modeled until a profile
+    is supplied)."""
     if source is None:
         return {}
     rows = _read_rows(source, None)
+    if not rows:
+        raise ValueError("File has no data rows.")
+    fieldnames = list(rows[0].keys())
+    hour_col = fieldnames[0]  # first column, whatever it's labeled ("hour", "Hr#", ...)
+    year_cols = [c for c in fieldnames[1:] if c.strip()]
+
     by_year = {}
+    for yc in year_cols:
+        try:
+            year = int(float(yc))
+        except ValueError:
+            continue  # skip any non-year column (e.g. a label column)
+        by_year[year] = [0.0] * 24
+
     for r in rows:
-        year = int(float(r["year"]))
-        hour = int(float(r["hour"]))
-        mw = float(r["mw"])
-        by_year.setdefault(year, [0.0] * 24)[hour] = mw
-    for year, profile in by_year.items():
-        if len(profile) != 24 or any(v is None for v in profile):
-            raise ValueError(f"Year {year} does not have all 24 hours (0-23) populated.")
+        hour = int(float(r[hour_col]))
+        if not (0 <= hour <= 23):
+            raise ValueError(f"Hour value {hour} is out of range 0-23.")
+        for yc in year_cols:
+            try:
+                year = int(float(yc))
+            except ValueError:
+                continue
+            val = r.get(yc, "")
+            by_year[year][hour] = float(val) if str(val).strip() != "" else 0.0
+
+    if any(len(v) != 24 for v in by_year.values()):
+        raise ValueError("Every year column must have all 24 hours (0-23) populated.")
     return by_year
 
 
@@ -190,32 +213,44 @@ def load_single_day_shape(source):
 
 
 # ---------------------------------------------------------------------------
-# CSV templates for download buttons in the app
+# CSV templates for download buttons in the app.
+# Where a bundled default exists (PV/wind profile, baseline demand shape,
+# underlying annual demand), the "template" IS that real data, re-exported in
+# the exact format the loader expects - download it, edit the numbers you
+# want to change, re-upload. Where no default exists (EV/marine, GV shape),
+# the template is an empty, correctly-shaped skeleton to fill in.
 # ---------------------------------------------------------------------------
 
-def cf_template_csv(column_name):
-    lines = ["hour,month,day,hour_of_day," + column_name]
-    for h in range(1, 25):
-        lines.append(f"{h},1,1,{h-1},0.0")
+def pv_cf_default_csv():
+    with open(os.path.join(DATA_DIR, "re_hourly_factors.csv"), encoding="utf-8-sig") as f:
+        return f.read()
+
+
+def wind_cf_default_csv():
+    with open(os.path.join(DATA_DIR, "re_hourly_factors.csv"), encoding="utf-8-sig") as f:
+        return f.read()
+
+
+def baseline_demand_default_csv():
+    with open(os.path.join(DATA_DIR, "baseline_demand_hourly_2024_MW.csv"), encoding="utf-8-sig") as f:
+        return f.read()
+
+
+def annual_table_default_csv(value_col="mwh"):
+    lines = ["year," + value_col]
+    for year, val in sorted(DEFAULT_UNDERLYING_DEMAND_MWH.items()):
+        lines.append(f"{year},{val}")
     return "\n".join(lines)
 
 
-def baseline_demand_template_csv():
-    lines = ["hour,month,day,hour_of_day,demand_mw_2024_shape"]
-    for h in range(1, 25):
-        lines.append(f"{h},1,1,{h-1},0.0")
-    return "\n".join(lines)
-
-
-def annual_table_template_csv(value_col="mwh"):
-    return "year," + value_col + "\n2028,0\n2030,0\n2035,0\n2040,0\n2050,0"
-
-
-def day_profile_by_year_template_csv():
-    lines = ["year,hour,mw"]
-    for year in (2028, 2030, 2035):
-        for h in range(24):
-            lines.append(f"{year},{h},0.0")
+def day_profile_by_year_template_csv(years=range(2025, 2041)):
+    """Wide format matching Combined_Hourly_Load: hour (0-23) as rows, one
+    column per year. Empty/zero skeleton - no real default data exists for
+    EV/marine yet."""
+    header = "hour," + ",".join(str(y) for y in years)
+    lines = [header]
+    for h in range(24):
+        lines.append(f"{h}," + ",".join("0.0" for _ in years))
     return "\n".join(lines)
 
 
