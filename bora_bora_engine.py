@@ -95,6 +95,7 @@ def simulate_year(
     initial_soc_mwh=None,
     edt_penetration_cap=1.0,
     ev_marine_shape="flat",
+    baseline_demand_hourly_mw=None,
 ):
     """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet.
     Excess after serving load charges BESS up to its limits; anything left
@@ -118,7 +119,12 @@ def simulate_year(
     otec_gen = np.full(HOURS, otec_mw * data.OTEC_CF)
 
     # --- demand: baseline shape scaled to this year's forecast, + EV/marine overlay ---
-    baseline_shape = np.array(data.load_baseline_demand_shape_mw())  # MW, 2024 shape
+    # Loaded ONCE by the caller (app.py) and passed in - not re-read from disk on every
+    # call, since this function runs thousands of times inside a grid search. Falls back
+    # to the bundled default only if the caller doesn't supply one (e.g. quick scripts/tests).
+    if baseline_demand_hourly_mw is None:
+        baseline_demand_hourly_mw = data.load_baseline_demand_shape_mw()
+    baseline_shape = np.array(baseline_demand_hourly_mw)  # MW, 2024 shape
     base_annual_mwh = data.BASELINE_ANNUAL_DEMAND_MWH
     # underlying (non-EV/marine) demand for this year:
     ev_marine_mwh = data.get_ev_marine_annual_mwh(year)
@@ -334,6 +340,7 @@ def size_tranche_schedule(
                                       # explicitly; until then, use the RE% target to control this instead.
     target_buffer_pct=3.0,           # extra RE% margin required at commissioning, to absorb degradation dip before next tranche
     pv_cf_hourly=None, wind_cf_hourly=None,
+    baseline_demand_hourly_mw=None,  # load once by the caller (e.g. from an uploaded CSV) and pass in here
     costs=DEFAULT_COSTS,
     verbose=True,
 ):
@@ -372,7 +379,8 @@ def size_tranche_schedule(
                     ))
 
                 r = simulate_year(ty, trial, pv_cf_hourly, wind_cf_hourly,
-                                   edt_penetration_cap=data.EDT_PENETRATION_CAP)
+                                   edt_penetration_cap=data.EDT_PENETRATION_CAP,
+                                   baseline_demand_hourly_mw=baseline_demand_hourly_mw)
 
                 feasible = (
                     r["re_pct"] >= required_pct
