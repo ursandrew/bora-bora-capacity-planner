@@ -2,23 +2,9 @@
 bora_bora_engine.py
 ====================
 Vintage-tracked, multi-tranche, multi-technology (PV / Wind / OTEC / BESS)
-capacity-expansion engine for the Bora Bora net-zero model.
-
-This is the piece the Excel workbook cannot do: Excel's Dispatch_2028 /
-2030 / 2035 / 2040 / 2050 sheets are independent, non-cumulative snapshots -
-each one assumes a single fixed capacity for that year. This engine instead
-tracks capacity as a list of TRANCHES per technology, each with its own
-commissioning year and its own degradation clock, so it can answer:
-"if I build X MWp in 2028, top up with Y MWp in 2035, and OTEC lands in
-2032, what does the RE%/curtailment/unmet-load trajectory look like every
-year from 2026 to 2050, accounting for each tranche degrading from the
-day IT was commissioned (not from year zero)?"
-
-Reuses the HOMER-style NPC/CRF methodology from
-optimize_gridsearch_hydro_WITH_DEGRADATION.py (the confirmed-correct
-reference backend), adapted to Bora Bora's technology set (PV + OTEC + BESS;
-Wind is modeled but excluded by default per Assumptions!B54=0) and to
-vintage/tranche tracking instead of a single fixed capacity for 25 years.
+capacity-expansion engine. Every technical and economic assumption is a
+function parameter with a default value - nothing is hardcoded that the
+app's UI can't override.
 """
 
 from dataclasses import dataclass, field
@@ -38,14 +24,13 @@ class Tranche:
     technology: str          # 'pv', 'wind', 'otec', 'bess'
     commissioning_year: int
     degradation_rate: float
-    # PV/Wind/OTEC:
     capacity_mw: float = 0.0     # PV: MWp (DC); Wind/OTEC: MW
-    # BESS:
-    power_mw: float = 0.0
-    energy_mwh: float = 0.0
+    power_mw: float = 0.0        # BESS only
+    energy_mwh: float = 0.0      # BESS only
+    capex_total: float = 0.0     # $ - stored on the tranche so cost tracking survives sizing
+    om_per_year: float = 0.0     # $/yr - at nameplate, before degradation
 
     def effective_factor(self, year):
-        """Fraction of nameplate/energy capacity still available in `year`."""
         if year < self.commissioning_year:
             return 0.0
         age = year - self.commissioning_year
@@ -54,17 +39,17 @@ class Tranche:
 
 @dataclass
 class TrancheSchedule:
-    """All tranches built up over the project so far, across technologies."""
     pv: list = field(default_factory=list)
     wind: list = field(default_factory=list)
     otec: list = field(default_factory=list)
     bess: list = field(default_factory=list)
 
     def clone(self):
-        return TrancheSchedule(
-            pv=list(self.pv), wind=list(self.wind),
-            otec=list(self.otec), bess=list(self.bess),
-        )
+        return TrancheSchedule(pv=list(self.pv), wind=list(self.wind),
+                                otec=list(self.otec), bess=list(self.bess))
+
+    def all_tranches(self):
+        return self.pv + self.wind + self.otec + self.bess
 
     def effective_pv_mwp(self, year):
         return sum(t.capacity_mw * t.effective_factor(year) for t in self.pv)
@@ -90,19 +75,20 @@ def simulate_year(
     year,
     schedule: TrancheSchedule,
     pv_cf_hourly, wind_cf_hourly,
-    dc_ac_ratio=1.3,
-    bess_charge_eff=0.95, bess_discharge_eff=0.95,
+    dc_ac_ratio,
+    bess_charge_eff, bess_discharge_eff,
+    otec_cf,
+    edt_penetration_cap,
+    baseline_demand_hourly_mw,
+    underlying_annual_table,
+    ev_marine_day_profiles,
+    gv_annual_mwh, gv_commissioning_year, gv_day_shape,
     initial_soc_mwh=None,
-    edt_penetration_cap=1.0,
-    ev_marine_shape="flat",
-    baseline_demand_hourly_mw=None,
 ):
-    """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet.
-    Excess after serving load charges BESS up to its limits; anything left
-    over is curtailed.
-
-    Returns a dict with hourly arrays and annual summary metrics, plus the
-    ending SOC (MWh) so the caller can carry it into the next year.
+    """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet
+    (unmet = demand not covered by RE - implicitly the diesel-served
+    fraction, since no diesel technology is modeled). Excess RE charges
+    BESS up to its limits; anything left over is curtailed.
     """
     pv_mwp = schedule.effective_pv_mwp(year)
     pv_mwac = pv_mwp / dc_ac_ratio if dc_ac_ratio else pv_mwp
@@ -112,39 +98,36 @@ def simulate_year(
     bess_energy_mwh = schedule.effective_bess_energy_mwh(year)
 
     pv_cf = np.array(pv_cf_hourly)
-    wind_cf = np.array(wind_cf_hourly) if wind_mw > 0 else np.zeros(HOURS)
+    wind_cf = np.array(wind_cf_hourly) if (wind_mw > 0 and wind_cf_hourly is not None) else np.zeros(HOURS)
 
     pv_gen = pv_mwac * pv_cf
     wind_gen = wind_mw * wind_cf
-    otec_gen = np.full(HOURS, otec_mw * data.OTEC_CF)
+    otec_gen = np.full(HOURS, otec_mw * otec_cf)
 
-    # --- demand: baseline shape scaled to this year's forecast, + EV/marine overlay ---
-    # Loaded ONCE by the caller (app.py) and passed in - not re-read from disk on every
-    # call, since this function runs thousands of times inside a grid search. Falls back
-    # to the bundled default only if the caller doesn't supply one (e.g. quick scripts/tests).
-    if baseline_demand_hourly_mw is None:
-        baseline_demand_hourly_mw = data.load_baseline_demand_shape_mw()
-    baseline_shape = np.array(baseline_demand_hourly_mw)  # MW, 2024 shape
-    base_annual_mwh = data.BASELINE_ANNUAL_DEMAND_MWH
-    # underlying (non-EV/marine) demand for this year:
-    ev_marine_mwh = data.get_ev_marine_annual_mwh(year)
-    underlying_mwh = data.get_annual_demand_mwh(year) - ev_marine_mwh
-    scale = underlying_mwh / base_annual_mwh
+    # --- demand: underlying (existing-development) + EV/marine + Grande Vaitape ---
+    baseline_shape = np.array(baseline_demand_hourly_mw)
+    underlying_mwh = data.lookup_annual(underlying_annual_table, year)
+    scale = underlying_mwh / data.BASELINE_ANNUAL_DEMAND_MWH
     underlying_hourly_mw = baseline_shape * scale
 
-    if ev_marine_shape == "flat":
-        ev_marine_hourly_mw = np.full(HOURS, ev_marine_mwh / HOURS)
-    else:
-        ev_marine_hourly_mw = np.array(ev_marine_shape)  # caller-supplied real profile
+    ev_marine_day = data.get_day_profile_for_year(ev_marine_day_profiles, year)
+    ev_marine_hourly_mw = np.array(data.tile_day_profile_to_year(ev_marine_day))
 
-    demand = underlying_hourly_mw + ev_marine_hourly_mw
+    if year >= gv_commissioning_year:
+        if gv_day_shape is not None:
+            gv_hourly_mw = np.array(data.tile_day_profile_to_year(gv_day_shape))
+        else:
+            gv_hourly_mw = np.full(HOURS, gv_annual_mwh / HOURS)
+    else:
+        gv_hourly_mw = np.zeros(HOURS)
+
+    demand = underlying_hourly_mw + ev_marine_hourly_mw + gv_hourly_mw
 
     # --- EDT intermittent penetration cap (solar+wind only, not OTEC) ---
-    # The cap limits how much of INSTANTANEOUS DEMAND may be served directly
-    # by solar+wind - it is NOT a ceiling on total generation. Intermittent
-    # output above that limit isn't lost: it's simply not allowed to inject
-    # straight to the grid, so - exactly like any other excess - it goes to
-    # charge the BESS first, and is only curtailed if the BESS is already full.
+    # Limits how much of INSTANTANEOUS DEMAND may be served directly by
+    # solar+wind - not a ceiling on total generation. Anything above that
+    # limit goes to charge the BESS first, and is only curtailed if the BESS
+    # is already full.
     intermittent_gen = pv_gen + wind_gen
     cap_limit = edt_penetration_cap * demand
     intermittent_to_grid = np.minimum(intermittent_gen, cap_limit)
@@ -155,8 +138,8 @@ def simulate_year(
     otec_excess = otec_gen - otec_to_grid
 
     total_served_by_gen = intermittent_to_grid + otec_to_grid
-    net_load = demand - total_served_by_gen              # >=0 always: remaining shortfall to be met by BESS/unmet
-    total_excess_for_bess = intermittent_excess_from_cap + otec_excess  # generation with nowhere to go but BESS/curtailment
+    net_load = demand - total_served_by_gen
+    total_excess_for_bess = intermittent_excess_from_cap + otec_excess
 
     soc = initial_soc_mwh if initial_soc_mwh is not None else 0.5 * bess_energy_mwh
     soc = min(soc, bess_energy_mwh)
@@ -165,7 +148,6 @@ def simulate_year(
     curtailed_after_bess = np.zeros(HOURS)
     bess_charge = np.zeros(HOURS)
     bess_discharge = np.zeros(HOURS)
-    soc_trace = np.zeros(HOURS)
 
     for h in range(HOURS):
         shortfall = net_load[h]
@@ -187,19 +169,15 @@ def simulate_year(
             curtailed_after_bess[h] = excess - c
 
         soc = max(0.0, min(soc, bess_energy_mwh))
-        soc_trace[h] = soc
 
     total_demand = demand.sum()
     total_unmet = unmet.sum()
     total_served = total_demand - total_unmet
     total_curtailment = curtailed_after_bess.sum()
-    re_delivered = total_served  # by construction, everything served is RE (no diesel modeled)
-    re_pct = (re_delivered / total_demand * 100) if total_demand > 0 else 0
+    re_pct = (total_served / total_demand * 100) if total_demand > 0 else 0
     unmet_pct = (total_unmet / total_demand * 100) if total_demand > 0 else 0
-    curtailment_pct_of_re_gen = (
-        total_curtailment / (pv_gen.sum() + wind_gen.sum() + otec_gen.sum()) * 100
-        if (pv_gen.sum() + wind_gen.sum() + otec_gen.sum()) > 0 else 0
-    )
+    total_re_gen = pv_gen.sum() + wind_gen.sum() + otec_gen.sum()
+    curtailment_pct_of_re_gen = (total_curtailment / total_re_gen * 100) if total_re_gen > 0 else 0
 
     return {
         "year": year,
@@ -216,206 +194,221 @@ def simulate_year(
     }
 
 
-def simulate_trajectory(schedule: TrancheSchedule, years, pv_cf_hourly, wind_cf_hourly, **kwargs):
-    """Run simulate_year across a range of years, carrying BESS SOC forward."""
+def simulate_trajectory(schedule: TrancheSchedule, years, **sim_kwargs):
+    """Runs simulate_year across a range of years, carrying BESS SOC forward."""
     results = []
     soc = None
     for year in years:
-        r = simulate_year(year, schedule, pv_cf_hourly, wind_cf_hourly,
-                           initial_soc_mwh=soc, **kwargs)
+        r = simulate_year(year, schedule, initial_soc_mwh=soc, **sim_kwargs)
         soc = r["ending_soc_mwh"]
         results.append(r)
     return results
 
 
 # ============================================================================
-# COST MODEL (HOMER-style NPC, adapted from optimize_gridsearch_hydro_WITH_DEGRADATION.py)
+# ECONOMICS - HOMER-style and cash-flow-style NPC/LCOE
 # ============================================================================
-# NOTE: the Bora Bora Excel workbook has NO cost/CAPEX/O&M sheet - it is a
-# purely technical (RE%/curtailment/unmet-load) model. The defaults below
-# are PLACEHOLDERS for PV/BESS (typical Pacific-island-scale figures) except
-# OTEC, whose CAPEX range (EUR102-152M for 1.2-2.6MW) is sourced from the
-# 2H Offshore Aug-2024 feasibility study and converted to USD/MW here at an
-# illustrative rate - replace ALL of these with validated client figures
-# before using this for an investment-grade cost comparison.
 
-DEFAULT_COSTS = {
-    "pv_capex_per_mwp": 900_000,       # USD/MWp installed (placeholder)
-    "pv_om_per_mwp_yr": 12_000,        # USD/MWp/yr (placeholder)
-    "pv_lifetime_yr": 25,
-    "bess_capex_per_mwh": 350_000,     # USD/MWh (placeholder)
-    "bess_om_per_mwh_yr": 7_000,       # USD/MWh/yr (placeholder)
-    "bess_lifetime_yr": 15,
-    "otec_capex_per_mw": 95_000_000,   # USD/MW - derived from 2H Offshore EUR102-152M / 1.2-2.6MW range midpoint, illustrative FX
-    "otec_om_per_mw_yr": 1_500_000,    # USD/MW/yr (placeholder, OTEC O&M is typically high - refine with study data)
-    "otec_lifetime_yr": 30,
-    "discount_rate_nominal": 0.08,
-    "inflation_rate": 0.02,
-}
-
-
-def crf(real_discount_rate, lifetime_yr):
-    i = real_discount_rate
-    n = lifetime_yr
-    if i == 0:
-        return 1 / n
-    return (i * (1 + i) ** n) / ((1 + i) ** n - 1)
+def crf(rate, lifetime_yr):
+    if rate == 0:
+        return 1 / lifetime_yr
+    return (rate * (1 + rate) ** lifetime_yr) / ((1 + rate) ** lifetime_yr - 1)
 
 
 def real_discount_rate(nominal, inflation):
     return (nominal - inflation) / (1 + inflation)
 
 
-def tranche_incremental_npc(pv_add_mwp, bess_add_mw, bess_add_mwh, costs=DEFAULT_COSTS):
-    """Simple NPC (capital + PV-of-O&M, no replacement/salvage) for ONE new
-    tranche, used to compare candidate tranche sizes against each other
-    during sizing at a single checkpoint year. Real discount rate applied
-    to O&M for the shorter of (technology lifetime, remaining project years)
-    - simplified here to the technology's own lifetime for tranche-vs-tranche
-    comparability."""
-    rdr = real_discount_rate(costs["discount_rate_nominal"], costs["inflation_rate"])
+def _tranche_capex(t: Tranche, unit_costs):
+    if t.technology == "pv":
+        return t.capacity_mw * unit_costs["pv_capex_per_mwp"]
+    if t.technology == "wind":
+        return t.capacity_mw * unit_costs["wind_capex_per_mw"]
+    if t.technology == "otec":
+        return t.capacity_mw * unit_costs["otec_capex_per_mw"]
+    if t.technology == "bess":
+        return t.energy_mwh * unit_costs["bess_capex_per_mwh"]
+    return 0.0
 
-    def pv_of_om(annual_om, lifetime):
-        if rdr == 0:
-            return annual_om * lifetime
-        return annual_om * (1 - (1 + rdr) ** -lifetime) / rdr
 
-    pv_capex = pv_add_mwp * costs["pv_capex_per_mwp"]
-    pv_om_npc = pv_of_om(pv_add_mwp * costs["pv_om_per_mwp_yr"], costs["pv_lifetime_yr"])
+def _tranche_om_per_year(t: Tranche, unit_costs):
+    if t.technology == "pv":
+        return t.capacity_mw * unit_costs["pv_om_per_mwp_yr"]
+    if t.technology == "wind":
+        return t.capacity_mw * unit_costs["wind_om_per_mw_yr"]
+    if t.technology == "otec":
+        return t.capacity_mw * unit_costs["otec_om_per_mw_yr"]
+    if t.technology == "bess":
+        return t.energy_mwh * unit_costs["bess_om_per_mwh_yr"]
+    return 0.0
 
-    bess_capex = bess_add_mwh * costs["bess_capex_per_mwh"]
-    bess_om_npc = pv_of_om(bess_add_mwh * costs["bess_om_per_mwh_yr"], costs["bess_lifetime_yr"])
+
+def _tranche_lifetime(t: Tranche, lifetimes):
+    return lifetimes[t.technology]
+
+
+def compute_lifecycle_economics(
+    schedule: TrancheSchedule, traj_df, unit_costs, lifetimes,
+    nominal_discount_rate, inflation_rate,
+    analysis_start_year, analysis_end_year,
+    method,  # "homer" or "cashflow"
+):
+    """Builds a year-by-year system cash flow from analysis_start_year to
+    analysis_end_year (inclusive) across ALL tranches, discounts it, and
+    returns total NPC and LCOE.
+
+    method="cashflow": nominal discount rate; O&M escalates with inflation;
+      no replacement modeled (CAPEX only at each tranche's own commissioning
+      year); no salvage. Matches NPV(costs)/NPV(energy).
+    method="homer": real discount rate; O&M held constant in real terms;
+      a tranche is replaced (full CAPEX again) every time its own lifetime
+      elapses within the horizon; any tranche with remaining useful life at
+      analysis_end_year gets a prorated salvage credit.
+    """
+    rate = (real_discount_rate(nominal_discount_rate, inflation_rate)
+            if method == "homer" else nominal_discount_rate)
+
+    energy_by_year = {int(row["year"]): row["total_served_mwh"] for _, row in traj_df.iterrows()}
+
+    years = list(range(analysis_start_year, analysis_end_year + 1))
+    npv_cost = 0.0
+    npv_energy = 0.0
+    cost_by_tech = {"pv": 0.0, "wind": 0.0, "otec": 0.0, "bess": 0.0}
+
+    for year in years:
+        t_idx = year - analysis_start_year
+        year_cost = 0.0
+
+        for t in schedule.all_tranches():
+            if year < t.commissioning_year:
+                continue
+            capex = _tranche_capex(t, unit_costs)
+            om_base = _tranche_om_per_year(t, unit_costs)
+            lifetime = _tranche_lifetime(t, lifetimes)
+            age = year - t.commissioning_year
+
+            tech_cost = 0.0
+            if year == t.commissioning_year:
+                tech_cost += capex
+            if method == "cashflow":
+                tech_cost += om_base * (1 + inflation_rate) ** t_idx
+            else:  # homer
+                tech_cost += om_base  # constant real terms
+                if age > 0 and lifetime > 0 and age % lifetime == 0 and year != t.commissioning_year:
+                    tech_cost += capex  # replacement event
+
+            year_cost += tech_cost
+            cost_by_tech[t.technology] += tech_cost / (1 + rate) ** t_idx
+
+        # HOMER-style salvage credit at the horizon end
+        if method == "homer" and year == analysis_end_year:
+            for t in schedule.all_tranches():
+                if year < t.commissioning_year:
+                    continue
+                lifetime = _tranche_lifetime(t, lifetimes)
+                age = year - t.commissioning_year
+                remaining_frac = 1 - (age % lifetime) / lifetime if lifetime > 0 else 0
+                salvage = _tranche_capex(t, unit_costs) * remaining_frac
+                year_cost -= salvage
+                cost_by_tech[t.technology] -= salvage / (1 + rate) ** t_idx
+
+        discount_factor = (1 + rate) ** t_idx
+        npv_cost += year_cost / discount_factor
+        npv_energy += energy_by_year.get(year, 0.0) / discount_factor
+
+    lcoe_per_mwh = (npv_cost / npv_energy) if npv_energy > 0 else 0.0
 
     return {
-        "pv_npc": pv_capex + pv_om_npc,
-        "bess_npc": bess_capex + bess_om_npc,
-        "total_npc": pv_capex + pv_om_npc + bess_capex + bess_om_npc,
+        "method": method,
+        "npv_cost": npv_cost,
+        "npv_energy_mwh": npv_energy,
+        "lcoe_per_mwh": lcoe_per_mwh,
+        "cost_by_technology": cost_by_tech,
     }
-
-
-def otec_tranche_npc(otec_mw, costs=DEFAULT_COSTS):
-    rdr = real_discount_rate(costs["discount_rate_nominal"], costs["inflation_rate"])
-
-    def pv_of_om(annual_om, lifetime):
-        if rdr == 0:
-            return annual_om * lifetime
-        return annual_om * (1 - (1 + rdr) ** -lifetime) / rdr
-
-    capex = otec_mw * costs["otec_capex_per_mw"]
-    om_npc = pv_of_om(otec_mw * costs["otec_om_per_mw_yr"], costs["otec_lifetime_yr"])
-    return capex + om_npc
 
 
 # ============================================================================
 # SEQUENTIAL TRANCHE SIZING
 # ============================================================================
 
-def re_target_for_year(year):
-    """Straight-line interpolation between the two LEGAL checkpoints
-    (75% @ 2030, 100% @ 2050). Used only as the glide-path REFERENCE line for
-    computing buffers - the actual constraint enforced at each tranche
-    checkpoint is 'checkpoints-only, bounded dip', see size_tranche_schedule()."""
+def re_target_for_year(year, target_2030, target_2050):
+    """Straight-line reference between the two checkpoints, used only to
+    compute the buffer at each tranche year - the actual constraint enforced
+    is 'checkpoints-only, bounded by buffer', see size_tranche_schedule()."""
     if year <= 2030:
-        # linear ramp from an assumed ~0% in 2024 baseline to 75% by 2030 (illustrative)
-        return data.RE_TARGET_2030 * min(1.0, (year - 2024) / (2030 - 2024)) if year > 2024 else 0.0
+        return target_2030 * min(1.0, max(0.0, (year - 2024) / (2030 - 2024)))
     if year >= 2050:
-        return data.RE_TARGET_2050
+        return target_2050
     frac = (year - 2030) / (2050 - 2030)
-    return data.RE_TARGET_2030 + frac * (data.RE_TARGET_2050 - data.RE_TARGET_2030)
+    return target_2030 + frac * (target_2050 - target_2030)
 
 
 def size_tranche_schedule(
-    tranche_years=(2028, 2030, 2035, 2040, 2050),
-    otec_tranche=None,               # a Tranche for OTEC, added at its own commissioning year automatically
-    pv_candidates_mwp=None,          # iterable of candidate ADDITIONAL MWp to try at each tranche year
-    bess_candidates_mwh=None,        # iterable of candidate ADDITIONAL MWh to try (power sized at 0.5C by default)
-    bess_c_rate=0.5,
-    curtailment_cap_pct=10.0,        # max curtailment as % of annual PV+wind+OTEC generation
-    unmet_load_ceiling_pct=100.0,    # NOTE: in this model (no diesel technology tracked), "unmet load %"
-                                      # IS mathematically (100 - RE%) - the demand not met by RE is
-                                      # implicitly covered by EDT's diesel backbone, not a blackout.
-                                      # So this is NOT an independent reliability constraint here - it's
-                                      # redundant with the RE% target and defaults to unconstrained (100%).
-                                      # Only tighten this once diesel dispatch/true blackout risk is modeled
-                                      # explicitly; until then, use the RE% target to control this instead.
-    target_buffer_pct=3.0,           # extra RE% margin required at commissioning, to absorb degradation dip before next tranche
-    pv_cf_hourly=None, wind_cf_hourly=None,
-    baseline_demand_hourly_mw=None,  # load once by the caller (e.g. from an uploaded CSV) and pass in here
-    costs=DEFAULT_COSTS,
-    verbose=True,
+    tranche_years,
+    pv_degradation_rate, bess_degradation_rate,
+    pv_candidates_mwp, bess_candidates_mwh, bess_c_rate,
+    curtailment_cap_pct, target_buffer_pct,
+    re_target_2030, re_target_2050,
+    sim_kwargs,           # dict of everything simulate_year needs besides `year`/`schedule`/`initial_soc_mwh`
+    pv_capex_per_mwp, bess_capex_per_mwh,  # used only to rank candidates within a tranche year (cheapest first)
+    exogenous_tranches=None,   # list of Tranche objects to seed the schedule with (OTEC, Wind if enabled)
+    unmet_load_ceiling_pct=100.0,
+    verbose=False,
 ):
-    """Greedy sequential sizing: at each tranche year (in order), grid-search
-    the minimum-NPC (PV, BESS) addition that satisfies the RE floor (target +
-    buffer) at that checkpoint year while respecting the curtailment cap and
-    unmet-load ceiling, given all previously-locked tranches (now degraded to
-    that year). OTEC is treated as exogenous (fixed capacity/timing decision
-    already made) and inserted into the schedule at its own commissioning year.
+    """Greedy sequential sizing: at each tranche year, grid-search the
+    minimum-cost (PV, BESS) addition that satisfies the RE floor (target +
+    buffer) at that checkpoint year while respecting the curtailment cap,
+    given all previously-locked tranches (now degraded to that year).
     """
-    if pv_candidates_mwp is None:
-        pv_candidates_mwp = list(range(0, 41, 2))     # 0..40 MWp in 2 MWp steps
-    if bess_candidates_mwh is None:
-        bess_candidates_mwh = list(range(0, 201, 20))  # 0..200 MWh in 20 MWh steps
-
     schedule = TrancheSchedule()
-    if otec_tranche is not None:
-        schedule.otec.append(otec_tranche)
+    for t in (exogenous_tranches or []):
+        getattr(schedule, t.technology).append(t)
 
     log = []
 
     for ty in tranche_years:
-        target_pct = re_target_for_year(ty) * 100
-        required_pct = target_pct + (target_buffer_pct if ty < 2050 else 0.0)  # no buffer needed at final checkpoint
+        target_pct = re_target_for_year(ty, re_target_2030, re_target_2050) * 100
+        required_pct = target_pct + (target_buffer_pct if ty < 2050 else 0.0)
 
         best = None
         for pv_add in pv_candidates_mwp:
             for bess_add_mwh in bess_candidates_mwh:
                 trial = schedule.clone()
                 if pv_add > 0:
-                    trial.pv.append(Tranche("pv", ty, data.PV_DEGRADATION_RATE, capacity_mw=pv_add))
+                    trial.pv.append(Tranche("pv", ty, pv_degradation_rate, capacity_mw=pv_add))
                 if bess_add_mwh > 0:
-                    trial.bess.append(Tranche(
-                        "bess", ty, data.BESS_DEGRADATION_RATE,
-                        power_mw=bess_add_mwh * bess_c_rate, energy_mwh=bess_add_mwh,
-                    ))
+                    trial.bess.append(Tranche("bess", ty, bess_degradation_rate,
+                                               power_mw=bess_add_mwh * bess_c_rate, energy_mwh=bess_add_mwh))
 
-                r = simulate_year(ty, trial, pv_cf_hourly, wind_cf_hourly,
-                                   edt_penetration_cap=data.EDT_PENETRATION_CAP,
-                                   baseline_demand_hourly_mw=baseline_demand_hourly_mw)
+                r = simulate_year(ty, trial, **sim_kwargs)
 
-                feasible = (
-                    r["re_pct"] >= required_pct
-                    and r["unmet_pct"] <= unmet_load_ceiling_pct
-                    and r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct
-                )
+                feasible = (r["re_pct"] >= required_pct
+                            and r["unmet_pct"] <= unmet_load_ceiling_pct
+                            and r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct)
                 if not feasible:
                     continue
 
-                incr_npc = tranche_incremental_npc(pv_add, bess_add_mwh * bess_c_rate, bess_add_mwh, costs)["total_npc"]
-                if best is None or incr_npc < best["npc"]:
-                    best = {"pv_add": pv_add, "bess_add_mwh": bess_add_mwh, "npc": incr_npc,
+                # simple capital-cost proxy for ranking candidates within one tranche year
+                # (full NPC/LCOE across the whole schedule is computed once, separately,
+                # after the schedule is locked in - see compute_lifecycle_economics)
+                cost_proxy = pv_add * pv_capex_per_mwp + bess_add_mwh * bess_capex_per_mwh
+                if best is None or cost_proxy < best["cost_proxy"]:
+                    best = {"pv_add": pv_add, "bess_add_mwh": bess_add_mwh, "cost_proxy": cost_proxy,
                             "re_pct": r["re_pct"], "unmet_pct": r["unmet_pct"],
                             "curtailment_pct": r["curtailment_pct_of_re_gen"]}
 
         if best is None:
-            log.append({"year": ty, "status": "INFEASIBLE within candidate grid - widen pv/bess candidate ranges"})
+            log.append({"year": ty, "status": "INFEASIBLE", "target_pct": target_pct, "required_pct": required_pct})
             if verbose:
-                print(f"[{ty}] INFEASIBLE - no candidate combination met target {required_pct:.1f}% "
-                      f"within curtailment/unmet constraints. Widen search grid.")
+                print(f"[{ty}] INFEASIBLE at target {required_pct:.1f}% - widen PV/BESS candidate ranges.")
             continue
 
         if best["pv_add"] > 0:
-            schedule.pv.append(Tranche("pv", ty, data.PV_DEGRADATION_RATE, capacity_mw=best["pv_add"]))
+            schedule.pv.append(Tranche("pv", ty, pv_degradation_rate, capacity_mw=best["pv_add"]))
         if best["bess_add_mwh"] > 0:
-            schedule.bess.append(Tranche(
-                "bess", ty, data.BESS_DEGRADATION_RATE,
-                power_mw=best["bess_add_mwh"] * bess_c_rate, energy_mwh=best["bess_add_mwh"],
-            ))
+            schedule.bess.append(Tranche("bess", ty, bess_degradation_rate,
+                                          power_mw=best["bess_add_mwh"] * bess_c_rate, energy_mwh=best["bess_add_mwh"]))
 
         log.append({"year": ty, "status": "OK", **best, "target_pct": target_pct, "required_pct": required_pct})
-        if verbose:
-            print(f"[{ty}] target {target_pct:.0f}% (+{target_buffer_pct if ty<2050 else 0:.0f}% buffer) -> "
-                  f"add PV +{best['pv_add']} MWp, BESS +{best['bess_add_mwh']} MWh "
-                  f"=> RE {best['re_pct']:.1f}%, unmet {best['unmet_pct']:.2f}%, "
-                  f"curtailment {best['curtailment_pct']:.1f}% of RE gen, incr. NPC ${best['npc']/1e6:.2f}M")
 
     return schedule, log
