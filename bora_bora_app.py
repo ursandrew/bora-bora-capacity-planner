@@ -34,6 +34,23 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Configuration")
 
+    st.subheader("📁 Data source")
+    st.caption(
+        "Uploads override the bundled Bora Bora defaults for this session only - "
+        "nothing is written back to the repo, so you can swap in an updated "
+        "carbon-team profile any time without redeploying the app."
+    )
+    pv_wind_upload = st.file_uploader(
+        "PV + Wind hourly generation factors (CSV)", type=["csv"],
+        help="Columns: hour, month, day, hour_of_day, pv_cf, wind_cf. 8,760 rows, one per hour. "
+             "Leave empty to use the bundled Bora Bora PVSYST/wind-timeseries data."
+    )
+    demand_upload = st.file_uploader(
+        "Baseline hourly demand shape (CSV)", type=["csv"],
+        help="Columns: hour, month, day, hour_of_day, demand_mw_2024_shape. 8,760 rows. "
+             "Leave empty to use the bundled 2024 EDT-derived baseline shape."
+    )
+
     st.subheader("OTEC (exogenous - already decided)")
     otec_mw = st.number_input("OTEC capacity (MW, net average delivered)", value=data.OTEC_CAPACITY_MW, step=0.1)
     otec_year = st.number_input("OTEC commissioning year", value=data.OTEC_COMMISSIONING_YEAR, step=1)
@@ -85,8 +102,18 @@ with st.sidebar:
 # RUN SIZING
 # ==============================================================================
 if run_button:
-    with st.spinner("Loading Bora Bora hourly generation/demand data..."):
-        pv_cf, wind_cf = data.load_hourly_generation_factors()
+    with st.spinner("Loading hourly generation/demand data..."):
+        try:
+            pv_cf, wind_cf = data.load_hourly_generation_factors(pv_wind_upload)
+            baseline_demand = data.load_baseline_demand_shape_mw(demand_upload)
+        except (ValueError, KeyError) as e:
+            st.error(f"❌ Problem reading an uploaded file: {e}")
+            st.stop()
+
+    if pv_wind_upload is not None:
+        st.info("Using uploaded PV/Wind generation profile (not the bundled default).")
+    if demand_upload is not None:
+        st.info("Using uploaded baseline demand shape (not the bundled default).")
 
     otec_tranche = eng.Tranche("otec", int(otec_year), data.OTEC_DEGRADATION_RATE, capacity_mw=otec_mw)
 
@@ -107,13 +134,17 @@ if run_button:
         bess_c_rate=bess_c_rate,
         curtailment_cap_pct=curtailment_cap_pct,
         target_buffer_pct=target_buffer_pct,
+        pv_cf_hourly=pv_cf, wind_cf_hourly=wind_cf,
+        baseline_demand_hourly_mw=baseline_demand,
         costs=costs,
         verbose=False,
     )
     progress_text.empty()
 
     years = list(range(2026, 2051))
-    traj = eng.simulate_trajectory(schedule, years, pv_cf, wind_cf, edt_penetration_cap=data.EDT_PENETRATION_CAP)
+    traj = eng.simulate_trajectory(schedule, years, pv_cf, wind_cf,
+                                    edt_penetration_cap=data.EDT_PENETRATION_CAP,
+                                    baseline_demand_hourly_mw=baseline_demand)
     traj_df = pd.DataFrame(traj)
 
     st.session_state["bb_schedule"] = schedule
