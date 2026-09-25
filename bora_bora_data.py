@@ -45,10 +45,14 @@ def _pick_column(row, candidates):
 # Hourly (8760-row) capacity-factor / demand-shape series
 # ---------------------------------------------------------------------------
 
-def load_hourly_series(source, value_columns, default_path):
+def load_hourly_series(source, value_columns, label):
     """Reads an 8760-row CSV and returns a plain list of floats from the
-    first matching column name in `value_columns`."""
-    rows = _read_rows(source, default_path)
+    first matching column name in `value_columns`. No bundled default -
+    a file must be uploaded through the UI; `label` names what's missing
+    in the error message."""
+    if source is None:
+        raise ValueError(f"Please upload a {label} CSV (none uploaded).")
+    rows = _read_rows(source, None)
     if not rows:
         raise ValueError("File has no data rows.")
     col = _pick_column(rows[0], value_columns)
@@ -59,17 +63,16 @@ def load_hourly_series(source, value_columns, default_path):
 
 
 def load_pv_cf(source=None):
-    return load_hourly_series(source, ["pv_cf", "cf"], os.path.join(DATA_DIR, "re_hourly_factors.csv"))
+    return load_hourly_series(source, ["pv_cf", "cf"], "PV generation-factor profile")
 
 
 def load_wind_cf(source=None):
-    return load_hourly_series(source, ["wind_cf", "cf"], os.path.join(DATA_DIR, "re_hourly_factors.csv"))
+    return load_hourly_series(source, ["wind_cf", "cf"], "wind generation-factor profile")
 
 
 def load_baseline_demand_shape_mw(source=None):
     return load_hourly_series(
-        source, ["demand_mw_2024_shape", "mw", "demand"],
-        os.path.join(DATA_DIR, "baseline_demand_hourly_2024_MW.csv"),
+        source, ["demand_mw_2024_shape", "mw", "demand"], "baseline demand shape",
     )
 
 
@@ -214,26 +217,29 @@ def load_single_day_shape(source):
 
 # ---------------------------------------------------------------------------
 # CSV templates for download buttons in the app.
-# Where a bundled default exists (PV/wind profile, baseline demand shape,
-# underlying annual demand), the "template" IS that real data, re-exported in
-# the exact format the loader expects - download it, edit the numbers you
-# want to change, re-upload. Where no default exists (EV/marine, GV shape),
-# the template is an empty, correctly-shaped skeleton to fill in.
+# Every template here is generated on the fly - correctly shaped and headed
+# for the matching loader, but with no data in it. Nothing is read from a
+# bundled file, so nothing needs to exist in the repo: upload is the only
+# source of PV/wind/baseline-demand data, same as EV/marine/GV below.
 # ---------------------------------------------------------------------------
 
-def pv_cf_default_csv():
-    with open(os.path.join(DATA_DIR, "re_hourly_factors.csv"), encoding="utf-8-sig") as f:
-        return f.read()
+def _hourly_skeleton_csv(value_col):
+    lines = [f"hour,{value_col}"]
+    for h in range(HOURS_PER_YEAR):
+        lines.append(f"{h},0.0")
+    return "\n".join(lines)
 
 
-def wind_cf_default_csv():
-    with open(os.path.join(DATA_DIR, "re_hourly_factors.csv"), encoding="utf-8-sig") as f:
-        return f.read()
+def pv_cf_template_csv():
+    return _hourly_skeleton_csv("pv_cf")
 
 
-def baseline_demand_default_csv():
-    with open(os.path.join(DATA_DIR, "baseline_demand_hourly_2024_MW.csv"), encoding="utf-8-sig") as f:
-        return f.read()
+def wind_cf_template_csv():
+    return _hourly_skeleton_csv("wind_cf")
+
+
+def baseline_demand_template_csv():
+    return _hourly_skeleton_csv("mw")
 
 
 def annual_table_default_csv(value_col="mwh"):
