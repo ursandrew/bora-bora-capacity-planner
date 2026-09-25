@@ -27,7 +27,7 @@ with st.sidebar:
     # --- PV -------------------------------------------------------------
     with st.expander("☀️ Solar PV", expanded=True):
         pv_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV)", type=["csv"], key="pv_upload")
-        st.download_button("Download template", data.cf_template_csv("pv_cf"), "pv_cf_template.csv", key="pv_tmpl")
+        st.download_button("Download current profile", data.pv_cf_default_csv(), "pv_cf.csv", key="pv_tmpl")
         dc_ac_ratio = st.number_input("DC:AC ratio", value=1.3, step=0.05)
         pv_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.3, step=0.1)
 
@@ -39,7 +39,7 @@ with st.sidebar:
         wind_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.5, step=0.1, disabled=not wind_enabled)
         wind_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV)", type=["csv"],
                                            key="wind_upload", disabled=not wind_enabled)
-        st.download_button("Download template", data.cf_template_csv("wind_cf"), "wind_cf_template.csv", key="wind_tmpl")
+        st.download_button("Download current profile", data.wind_cf_default_csv(), "wind_cf.csv", key="wind_tmpl")
 
     # --- OTEC -------------------------------------------------------------
     with st.expander("🌊 OTEC", expanded=True):
@@ -58,15 +58,25 @@ with st.sidebar:
 
     # --- Demand: baseline ---------------------------------------------
     with st.expander("🏝️ Demand — existing development (baseline)", expanded=False):
+        st.caption("Shape = one full 8,760-hour reference year (the pattern). "
+                   "Annual table = each year's total MWh (the multiplier applied to the shape).")
         baseline_shape_upload = st.file_uploader("Hourly demand shape, one calendar year (CSV)", type=["csv"], key="baseline_upload")
-        st.download_button("Download template", data.baseline_demand_template_csv(), "baseline_demand_template.csv", key="baseline_tmpl")
+        st.download_button("Download current shape", data.baseline_demand_default_csv(), "baseline_demand.csv", key="baseline_tmpl")
         annual_table_upload = st.file_uploader("Annual demand by year (CSV)", type=["csv"], key="annual_upload")
-        st.download_button("Download template", data.annual_table_template_csv(), "annual_demand_template.csv", key="annual_tmpl")
+        st.download_button("Download current table", data.annual_table_default_csv(), "annual_demand.csv", key="annual_tmpl")
 
-    # --- Demand: EV + marine ---------------------------------------------
-    with st.expander("🔌 Demand — EV (excl. bus) + marine transport", expanded=False):
-        ev_marine_upload = st.file_uploader("Day profile by year (CSV: year, hour, mw)", type=["csv"], key="ev_upload")
-        st.download_button("Download template", data.day_profile_by_year_template_csv(), "ev_marine_template.csv", key="ev_tmpl")
+    # --- Demand: EV chargers (land, excl. bus) ---------------------------------------------
+    with st.expander("🔌 Demand — EV chargers (land, excl. bus)", expanded=False):
+        st.caption("Hour (0-23) as rows, one column per year - same layout as Combined_Hourly_Load. "
+                   "One day's pattern is repeated for every day of that year.")
+        ev_land_upload = st.file_uploader("Day profile by year (CSV)", type=["csv"], key="ev_land_upload")
+        st.download_button("Download template", data.day_profile_by_year_template_csv(), "ev_land_template.csv", key="ev_land_tmpl")
+
+    # --- Demand: Marine transport ---------------------------------------------
+    with st.expander("⛴️ Demand — Marine transport (shore power)", expanded=False):
+        st.caption("Same layout as EV chargers above: hour (0-23) as rows, one column per year.")
+        marine_upload = st.file_uploader("Day profile by year (CSV)", type=["csv"], key="marine_upload")
+        st.download_button("Download template", data.day_profile_by_year_template_csv(), "marine_template.csv", key="marine_tmpl")
 
     # --- Demand: Grande Vaitape ---------------------------------------------
     with st.expander("🏗️ Demand — Grande Vaitape", expanded=False):
@@ -137,7 +147,14 @@ if run_button:
                 data.load_wind_cf(None) if wind_enabled else None)
             baseline_demand = data.load_baseline_demand_shape_mw(baseline_shape_upload)
             underlying_table = data.load_annual_table(annual_table_upload, data.DEFAULT_UNDERLYING_DEMAND_MWH)
-            ev_marine_profiles = data.load_day_profiles_by_year(ev_marine_upload)
+            ev_land_profiles = data.load_day_profiles_by_year(ev_land_upload)
+            marine_profiles = data.load_day_profiles_by_year(marine_upload)
+            combined_years = sorted(set(ev_land_profiles) | set(marine_profiles))
+            ev_marine_profiles = {
+                year: [a + b for a, b in zip(data.get_day_profile_for_year(ev_land_profiles, year),
+                                              data.get_day_profile_for_year(marine_profiles, year))]
+                for year in combined_years
+            }
             gv_day_shape = data.load_single_day_shape(gv_shape_upload)
     except (ValueError, KeyError) as e:
         st.error(f"Problem reading an uploaded file: {e}")
