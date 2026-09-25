@@ -55,31 +55,60 @@ EDT_PENETRATION_CAP = 1.0  # Assumptions!B101 - currently uncapped in this scena
 WIND_INCLUDED = False  # Assumptions!B54 = 0 in current scenario
 
 
-def load_hourly_generation_factors():
-    """Returns dict of 8760-length lists: pv_cf, wind_cf (per-MW normalized).
-    OTEC CF is NOT read from file - it's overridden to the flat corrected
-    value (OTEC_CF) since the raw file still has the old 3MW/0.9 placeholder.
+def _open_text(source):
+    """Accepts: None (-> bundled default under DATA_DIR keyed by caller),
+    a filesystem path (str/Path), or a file-like object (e.g. Streamlit's
+    UploadedFile from st.file_uploader, which yields bytes). Returns
+    something csv.DictReader can iterate as text lines."""
+    if hasattr(source, "read"):  # file-like (e.g. st.file_uploader result)
+        raw = source.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8-sig")
+        return raw.splitlines()
+    # plain path
+    with open(source, newline="", encoding="utf-8-sig") as f:
+        return f.readlines()
+
+
+def load_hourly_generation_factors(source=None):
+    """Returns (pv_cf, wind_cf) - two 8760-length lists (per-MW normalized).
+    `source`: None -> bundled default CSV shipped in this repo;
+              a file path -> read from disk;
+              a file-like object (e.g. from st.file_uploader) -> read from upload,
+              so a new profile can be swapped in from the browser without
+              touching the repo.
+    Expected columns: hour, month, day, hour_of_day, pv_cf, wind_cf[, otec_cf].
+    OTEC CF is NOT read from file even if present - it's always overridden to
+    the flat corrected value (OTEC_CF), since the bundled default's OTEC
+    column reflects the old, superseded 3MW/0.9 placeholder.
     """
+    if source is None:
+        source = os.path.join(DATA_DIR, "re_hourly_factors.csv")
+    lines = _open_text(source)
+    reader = csv.DictReader(lines)
     pv_cf, wind_cf = [], []
-    path = os.path.join(DATA_DIR, "re_hourly_factors.csv")
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            pv_cf.append(float(row["pv_cf"]))
-            wind_cf.append(float(row["wind_cf"]))
-    assert len(pv_cf) == HOURS_PER_YEAR, f"expected 8760 hours, got {len(pv_cf)}"
+    for row in reader:
+        pv_cf.append(float(row["pv_cf"]))
+        wind_cf.append(float(row["wind_cf"]))
+    if len(pv_cf) != HOURS_PER_YEAR:
+        raise ValueError(f"Expected 8760 hourly rows, got {len(pv_cf)}. "
+                          f"Check the uploaded file has one row per hour, no gaps.")
     return pv_cf, wind_cf
 
 
-def load_baseline_demand_shape_mw():
-    """Returns 8760-length list of baseline (2024) hourly demand in MW."""
-    demand = []
-    path = os.path.join(DATA_DIR, "baseline_demand_hourly_2024_MW.csv")
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            demand.append(float(row["demand_mw_2024_shape"]))
-    assert len(demand) == HOURS_PER_YEAR
+def load_baseline_demand_shape_mw(source=None):
+    """Returns an 8760-length list of baseline hourly demand (MW).
+    `source`: None -> bundled default; a path or file-like object (upload) ->
+    read from there instead. Expected column: demand_mw_2024_shape (plus the
+    same hour/month/day/hour_of_day columns as the generation-factors file)."""
+    if source is None:
+        source = os.path.join(DATA_DIR, "baseline_demand_hourly_2024_MW.csv")
+    lines = _open_text(source)
+    reader = csv.DictReader(lines)
+    demand = [float(row["demand_mw_2024_shape"]) for row in reader]
+    if len(demand) != HOURS_PER_YEAR:
+        raise ValueError(f"Expected 8760 hourly rows, got {len(demand)}. "
+                          f"Check the uploaded file has one row per hour, no gaps.")
     return demand
 
 
