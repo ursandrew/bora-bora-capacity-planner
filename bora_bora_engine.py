@@ -84,11 +84,18 @@ def simulate_year(
     ev_marine_day_profiles,
     gv_annual_mwh, gv_commissioning_year, gv_day_shape,
     initial_soc_mwh=None,
+    return_hourly=False,
 ):
     """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet
     (unmet = demand not covered by RE - implicitly the diesel-served
     fraction, since no diesel technology is modeled). Excess RE charges
     BESS up to its limits; anything left over is curtailed.
+
+    `return_hourly=True` adds the full 8,760-hour arrays (demand, each
+    technology's generation, BESS charge/discharge/SOC, unmet, curtailment)
+    to the returned dict under an "hourly" key - off by default since the
+    sizing search calls this thousands of times and only needs the annual
+    totals.
     """
     pv_mwp = schedule.effective_pv_mwp(year)
     pv_mwac = pv_mwp / dc_ac_ratio if dc_ac_ratio else pv_mwp
@@ -148,6 +155,7 @@ def simulate_year(
     curtailed_after_bess = np.zeros(HOURS)
     bess_charge = np.zeros(HOURS)
     bess_discharge = np.zeros(HOURS)
+    soc_hourly = np.zeros(HOURS)
 
     for h in range(HOURS):
         shortfall = net_load[h]
@@ -169,6 +177,7 @@ def simulate_year(
             curtailed_after_bess[h] = excess - c
 
         soc = max(0.0, min(soc, bess_energy_mwh))
+        soc_hourly[h] = soc
 
     total_demand = demand.sum()
     total_unmet = unmet.sum()
@@ -179,7 +188,7 @@ def simulate_year(
     total_re_gen = pv_gen.sum() + wind_gen.sum() + otec_gen.sum()
     curtailment_pct_of_re_gen = (total_curtailment / total_re_gen * 100) if total_re_gen > 0 else 0
 
-    return {
+    result = {
         "year": year,
         "pv_mwp": pv_mwp, "pv_mwac": pv_mwac, "wind_mw": wind_mw,
         "otec_mw": otec_mw, "bess_power_mw": bess_power_mw, "bess_energy_mwh": bess_energy_mwh,
@@ -193,6 +202,23 @@ def simulate_year(
         "ending_soc_mwh": soc,
     }
 
+    if return_hourly:
+        result["hourly"] = {
+            "hour": np.arange(HOURS),
+            "demand_mw": demand,
+            "pv_gen_mw": pv_gen,
+            "wind_gen_mw": wind_gen,
+            "otec_gen_mw": otec_gen,
+            "bess_charge_mw": bess_charge,
+            "bess_discharge_mw": bess_discharge,
+            "soc_mwh": soc_hourly,
+            "unmet_mw": unmet,
+            "curtailment_mw": curtailed_after_bess,
+            "served_mw": demand - unmet,
+        }
+
+    return result
+
 
 def simulate_trajectory(schedule: TrancheSchedule, years, **sim_kwargs):
     """Runs simulate_year across a range of years, carrying BESS SOC forward."""
@@ -203,6 +229,37 @@ def simulate_trajectory(schedule: TrancheSchedule, years, **sim_kwargs):
         soc = r["ending_soc_mwh"]
         results.append(r)
     return results
+
+
+def simulate_trajectory_hourly(schedule: TrancheSchedule, years, **sim_kwargs):
+    """Like simulate_trajectory, but returns one row per (year, hour) with
+    the full dispatch detail - demand, each technology's generation, BESS
+    charge/discharge/SOC, unmet and curtailment, in MW for every hour of
+    every year. Use for a detailed year-by-year dispatch review; this is
+    ~8,760 rows per year, so only call it once per schedule (not inside a
+    sizing search)."""
+    rows = []
+    soc = None
+    for year in years:
+        r = simulate_year(year, schedule, initial_soc_mwh=soc, return_hourly=True, **sim_kwargs)
+        soc = r["ending_soc_mwh"]
+        h = r["hourly"]
+        n = len(h["hour"])
+        for i in range(n):
+            rows.append({
+                "year": year, "hour": int(h["hour"][i]),
+                "demand_mw": h["demand_mw"][i],
+                "pv_gen_mw": h["pv_gen_mw"][i],
+                "wind_gen_mw": h["wind_gen_mw"][i],
+                "otec_gen_mw": h["otec_gen_mw"][i],
+                "bess_charge_mw": h["bess_charge_mw"][i],
+                "bess_discharge_mw": h["bess_discharge_mw"][i],
+                "soc_mwh": h["soc_mwh"][i],
+                "served_mw": h["served_mw"][i],
+                "unmet_mw": h["unmet_mw"][i],
+                "curtailment_mw": h["curtailment_mw"][i],
+            })
+    return rows
 
 
 # ============================================================================
