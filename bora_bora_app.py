@@ -239,6 +239,8 @@ if run_button:
     st.session_state.update(bb_schedule=schedule, bb_log=log, bb_traj_df=traj_df,
                              bb_econ_cashflow=econ_cashflow, bb_econ_homer=econ_homer,
                              bb_re_target_2030=re_target_2030_pct / 100, bb_re_target_2050=re_target_2050_pct / 100,
+                             bb_sim_kwargs=sim_kwargs, bb_years=years,
+                             bb_hourly_csv=None,  # cleared on every new Run - stale hourly export otherwise
                              bb_done=True)
 
 # ==============================================================================
@@ -337,6 +339,22 @@ if st.session_state.get("bb_done"):
         pd.DataFrame(comp_rows, columns=["Metric", "HOMER", "Cash-flow"]).to_excel(writer, sheet_name="Economics", index=False)
     st.download_button("Download results (Excel)", data=buf.getvalue(), file_name="bora_bora_capacity_plan.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.markdown("---")
+    st.subheader("Full hourly dispatch (every year, 8,760 hours each)")
+    st.caption("One row per hour per year - demand, PV/wind/OTEC generation, BESS charge/discharge/state of "
+               "charge, served, unmet and curtailment, all in MW (MWh for SOC). Matches this run's locked-in "
+               "tranche schedule. This is a large file (years × 8,760 rows) and takes a few seconds to build.")
+    if st.button("Generate hourly dispatch CSV"):
+        with st.spinner("Simulating hourly dispatch for every year..."):
+            hourly_rows = eng.simulate_trajectory_hourly(
+                schedule, st.session_state["bb_years"], **st.session_state["bb_sim_kwargs"]
+            )
+            hourly_df = pd.DataFrame(hourly_rows)
+            st.session_state["bb_hourly_csv"] = hourly_df.to_csv(index=False)
+    if st.session_state.get("bb_hourly_csv"):
+        st.download_button("Download hourly dispatch (CSV)", data=st.session_state["bb_hourly_csv"],
+                            file_name="bora_bora_hourly_dispatch_all_years.csv", mime="text/csv")
 
 else:
     st.info("Configure inputs in the sidebar, then click Run.")
