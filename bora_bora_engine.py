@@ -101,6 +101,7 @@ def simulate_year(
     rooftop_existing_mwp=0.0, rooftop_ceiling_mwp=0.0,
     rooftop_ramp_start_year=2025, rooftop_ramp_mwp_per_year=0.0,
     rooftop_self_consumption_pct=0.93,
+    bess_initial_soc_frac=0.5, bess_min_soc_frac=0.05, bess_max_soc_frac=0.95,
 ):
     """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet
     (unmet = demand not covered by RE - implicitly the diesel-served
@@ -119,6 +120,16 @@ def simulate_year(
     to the returned dict under an "hourly" key - off by default since the
     sizing search calls this thousands of times and only needs the annual
     totals.
+
+    BESS SOC: the fleet is tracked as one pooled scalar (not per-tranche), so
+    "a new tranche starts at bess_initial_soc_frac" is modeled as: whenever
+    this year's effective BESS energy capacity is larger than last year's
+    (schedule.effective_bess_energy_mwh(year) > ...(year-1)), that INCREMENT
+    is topped up to bess_initial_soc_frac and added to whatever SOC the
+    existing fleet already had - the pre-existing capacity's charge level is
+    left untouched. Every hour, charge/discharge is bounded so SOC never
+    leaves [bess_min_soc_frac, bess_max_soc_frac] of that year's total
+    capacity.
     """
     pv_mwp = schedule.effective_pv_mwp(year)
     pv_mwac = pv_mwp / dc_ac_ratio if dc_ac_ratio else pv_mwp
@@ -181,8 +192,20 @@ def simulate_year(
     net_load = demand - total_served_by_gen
     total_excess_for_bess = intermittent_excess_from_cap + otec_excess
 
-    soc = initial_soc_mwh if initial_soc_mwh is not None else 0.5 * bess_energy_mwh
-    soc = min(soc, bess_energy_mwh)
+    min_soc_mwh = bess_min_soc_frac * bess_energy_mwh
+    max_soc_mwh = bess_max_soc_frac * bess_energy_mwh
+
+    prior_bess_energy_mwh = schedule.effective_bess_energy_mwh(year - 1)
+    newly_commissioned_mwh = max(0.0, bess_energy_mwh - prior_bess_energy_mwh)
+    if initial_soc_mwh is not None:
+        # continuing from a previous simulated year: keep the carried-over SOC, and top up
+        # ONLY the newly-commissioned increment (if any) to the initial-SOC fraction
+        soc = initial_soc_mwh + bess_initial_soc_frac * newly_commissioned_mwh
+    else:
+        # first simulated year (or a sizing-search trial, which never carries SOC forward):
+        # the whole effective fleet at this point starts at the initial-SOC fraction
+        soc = bess_initial_soc_frac * bess_energy_mwh
+    soc = max(min_soc_mwh, min(soc, max_soc_mwh))
 
     unmet = np.zeros(HOURS)
     curtailed_after_bess = np.zeros(HOURS)
@@ -197,7 +220,7 @@ def simulate_year(
         excess = total_excess_for_bess[h]
 
         if shortfall > 0:
-            max_discharge = min(bess_power_mw, soc * bess_discharge_eff)
+            max_discharge = min(bess_power_mw, max(0.0, soc - min_soc_mwh) * bess_discharge_eff)
             d = min(shortfall, max_discharge)
             d_from_soc = d / bess_discharge_eff if bess_discharge_eff > 0 else d
             soc -= d_from_soc
@@ -206,7 +229,7 @@ def simulate_year(
             unmet[h] = shortfall - d
 
         if excess > 0:
-            room = bess_energy_mwh - soc
+            room = max(0.0, max_soc_mwh - soc)
             max_charge = min(bess_power_mw, room / bess_charge_eff if bess_charge_eff > 0 else room)
             c = min(excess, max_charge)
             c_to_soc = c * bess_charge_eff
@@ -215,7 +238,7 @@ def simulate_year(
             bess_charge_after_eff[h] = c_to_soc
             curtailed_after_bess[h] = excess - c
 
-        soc = max(0.0, min(soc, bess_energy_mwh))
+        soc = max(min_soc_mwh, min(soc, max_soc_mwh))
         soc_hourly[h] = soc
 
     total_demand = demand.sum()
@@ -508,19 +531,20 @@ def size_tranche_schedule(
                               # tranche year, bypassing the glide-path+buffer calculation for that
                               # year only; every other tranche year is unaffected.
     wind_candidates_mw=None,      # None/[] -> wind is not optimized (any wind capacity must be
-                                   # passed in via exogenous_tranches instead, as a fixed input)
+                                   # passed in via exogenous_tranches instead, as a fixed input).
+                                   # Otherwise wind is searched at EVERY tranche year, exactly like
+                                   # PV/BESS - each addition becomes its own vintage-tracked tranche.
     wind_degradation_rate=0.0,
-    wind_commissioning_year=None,  # the ONE tranche year at which wind is sized (wind is a single
-                                    # one-time build per the locked assumption, not re-tranched like
-                                    # PV/BESS) - must be one of tranche_years for the search to run there
     wind_capex_per_mw=0.0,
     verbose=False,
 ):
     """Greedy sequential sizing: at each tranche year, grid-search the
-    minimum-cost (PV, BESS) addition that satisfies the RE floor (target +
-    buffer, or an explicit override) at that checkpoint year while
-    respecting the curtailment cap, given all previously-locked tranches
-    (now degraded to that year).
+    minimum-cost (PV, BESS, and - if wind_candidates_mw is given - Wind)
+    addition that satisfies the RE floor (target + buffer, or an explicit
+    override) at that checkpoint year while respecting the curtailment cap,
+    given all previously-locked tranches (now degraded to that year). With
+    wind included, the search is 3D (PV x BESS x Wind) at every tranche
+    year, not just PV x BESS - materially slower.
     """
     schedule = TrancheSchedule()
     for t in (exogenous_tranches or []):
@@ -540,10 +564,10 @@ def size_tranche_schedule(
             required_pct = target_pct + (target_buffer_pct if ty < 2050 else 0.0)
             is_override = False
 
-        # Wind is a single one-time build (locked assumption), so it's only searched at its own
-        # commissioning year - every other tranche year gets a 1-element [0] "no wind here" list,
-        # which keeps the search 2D (PV x BESS) everywhere except that one year.
-        wind_candidates_this_year = wind_candidates_mw if (wind_candidates_mw and ty == wind_commissioning_year) else [0]
+        # Wind is searched at every tranche year, exactly like PV/BESS, when wind_candidates_mw is
+        # given; each year's chosen wind_add (including 0 = "add nothing this year") becomes its own
+        # vintage-tracked tranche, same as PV/BESS additions.
+        wind_candidates_this_year = wind_candidates_mw if wind_candidates_mw else [0]
 
         best = None
         for pv_add in pv_candidates_mwp:
