@@ -40,18 +40,53 @@ st.markdown("""
 with st.sidebar:
 
     # --- PV -------------------------------------------------------------
-    with st.expander("☀️ Solar PV", expanded=True):
+    with st.expander("☀️ Solar PV (Agri)", expanded=True):
         pv_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV) - required", type=["csv"], key="pv_upload")
         st.download_button("Download blank template", data.pv_cf_template_csv(), "pv_cf_template.csv", key="pv_tmpl")
         dc_ac_ratio = st.number_input("DC:AC ratio", value=1.3, step=0.05)
         pv_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.3, step=0.1)
 
+    # --- Rooftop ----------------------------------------------------------
+    with st.expander("🏠 Rooftop PV", expanded=False):
+        rooftop_enabled = st.checkbox("Include rooftop (exported-to-grid share only)", value=True)
+        st.caption("The self-consumed share is already netted out of your Underlying annual demand table "
+                   "(Forecast_Annual's 'net of rooftop solar' row) - adding it again here would double-count it. "
+                   "Only the exported share below is added as generation. Uses the same hourly CF shape as Agri PV.")
+        rooftop_existing_mwp = st.number_input("Existing capacity (MWp)", value=2.357, step=0.1, disabled=not rooftop_enabled)
+        rooftop_ceiling_mwp = st.number_input("Ceiling capacity (MWp)", value=4.5, step=0.1, disabled=not rooftop_enabled)
+        rooftop_ramp_start_year = st.number_input(
+            "Last year at existing capacity (ramp begins the following year)", value=2025, step=1,
+            disabled=not rooftop_enabled,
+            help="Matches Forecast_Annual: capacity is flat at 'Existing capacity' through this year, then "
+                 "grows by 'New capacity added (MWp/yr)' every year after it, capped at 'Ceiling capacity'.")
+        rooftop_ramp_mwp_per_year = st.number_input("New capacity added (MWp/yr)", value=0.143, step=0.01, format="%.3f",
+                                                     disabled=not rooftop_enabled)
+        rooftop_self_consumption_pct = st.number_input("Self-consumption offset (%)", value=93.0, step=1.0,
+                                                         disabled=not rooftop_enabled) / 100
+
     # --- Wind -------------------------------------------------------------
     with st.expander("💨 Wind", expanded=False):
         wind_enabled = st.checkbox("Include wind", value=False)
-        wind_mw = st.number_input("Capacity (MW)", value=4.125, step=0.1, disabled=not wind_enabled)
+        wind_sizing_mode = st.radio("Wind sizing", ["Fixed capacity", "Optimize capacity"],
+                                     disabled=not wind_enabled, horizontal=True,
+                                     help="Fixed: you set the MW directly (today's behaviour). Optimize: the sizing "
+                                          "search picks the cheapest wind MW (from the range below) jointly with "
+                                          "PV+BESS, at wind's own commissioning year only - wind is a single "
+                                          "one-time build, not re-tranched like PV/BESS at every checkpoint.")
         wind_commissioning_year = st.number_input("Commissioning year", value=2028, step=1, disabled=not wind_enabled)
         wind_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.5, step=0.1, disabled=not wind_enabled)
+        if wind_sizing_mode == "Fixed capacity":
+            wind_mw = st.number_input("Capacity (MW)", value=4.125, step=0.1, disabled=not wind_enabled)
+            wind_min_mw, wind_max_mw, wind_step_mw = None, None, None
+        else:
+            wind_mw = None
+            c1, c2, c3 = st.columns(3)
+            wind_min_mw = c1.number_input("Min (MW)", value=0.0, step=0.5, disabled=not wind_enabled)
+            wind_max_mw = c2.number_input("Max (MW)", value=10.0, step=0.5, disabled=not wind_enabled)
+            wind_step_mw = c3.number_input("Step (MW)", value=1.0, step=0.5, disabled=not wind_enabled)
+            st.caption("Adds a 3rd search dimension (PV x BESS x Wind) at the commissioning year above only - "
+                       "materially slower than PV+BESS alone. If that year isn't already in 'Tranche years', "
+                       "it's added automatically so the search has somewhere to size wind.")
         wind_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV) - required if wind is included", type=["csv"],
                                            key="wind_upload", disabled=not wind_enabled)
         st.download_button("Download blank template", data.wind_cf_template_csv(), "wind_cf_template.csv", key="wind_tmpl")
@@ -111,6 +146,12 @@ with st.sidebar:
         tranche_years_str = st.text_input("Tranche years (comma-separated)", "2028, 2030, 2035, 2040, 2050")
         target_buffer_pct = st.slider("Buffer at commissioning (percentage points)", 0.0, 15.0, 3.0, 0.5)
         curtailment_cap_pct = st.slider("Max curtailment (% of PV+Wind+OTEC generation)", 1.0, 30.0, 10.0, 1.0)
+        target_overrides_str = st.text_input(
+            "Target overrides per tranche year (optional, format 'year:pct', comma-separated)", "")
+        st.caption("Pins an exact required RE% at one specific tranche year, replacing the glide-path+buffer "
+                   "calculation for that year only - every other tranche year keeps using the glide path and "
+                   "buffer above. Example: '2028:78' forces the 2028 sizing search to hit 78% RE at 2028 "
+                   "without changing what's required at 2030/2040/2050.")
 
     # --- Search grid ---------------------------------------------
     with st.expander("🔍 Sizing search grid", expanded=False):
@@ -177,13 +218,43 @@ if run_button:
 
     tranche_years = tuple(int(y.strip()) for y in tranche_years_str.split(",") if y.strip())
 
+    wind_optimize = wind_enabled and wind_sizing_mode == "Optimize capacity"
+    if wind_optimize and int(wind_commissioning_year) not in tranche_years:
+        tranche_years = tuple(sorted(set(tranche_years) | {int(wind_commissioning_year)}))
+        st.info(f"Wind's commissioning year {int(wind_commissioning_year)} was added to Tranche years so the "
+                f"search has a year to size it at.")
+
+    target_overrides = {}
+    for pair in target_overrides_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            st.error(f"Target override '{pair}' isn't in 'year:pct' format.")
+            st.stop()
+        y_str, p_str = pair.split(":", 1)
+        try:
+            target_overrides[int(y_str.strip())] = float(p_str.strip())
+        except ValueError:
+            st.error(f"Target override '{pair}' isn't in 'year:pct' format.")
+            st.stop()
+
     exogenous_tranches = []
     if otec_enabled:
         exogenous_tranches.append(eng.Tranche("otec", int(otec_commissioning_year), otec_degradation_pct / 100,
                                                capacity_mw=otec_mw))
-    if wind_enabled:
+    if wind_enabled and not wind_optimize:
         exogenous_tranches.append(eng.Tranche("wind", int(wind_commissioning_year), wind_degradation_pct / 100,
                                                capacity_mw=wind_mw))
+
+    if wind_optimize:
+        wind_candidates = []
+        w = float(wind_min_mw)
+        while w <= wind_max_mw + 1e-9:
+            wind_candidates.append(round(w, 4))
+            w += wind_step_mw
+    else:
+        wind_candidates = []
 
     sim_kwargs = dict(
         pv_cf_hourly=pv_cf, wind_cf_hourly=wind_cf,
@@ -195,12 +266,18 @@ if run_button:
         underlying_annual_table=underlying_table,
         ev_marine_day_profiles=ev_marine_profiles,
         gv_annual_mwh=gv_annual_mwh, gv_commissioning_year=int(gv_commissioning_year), gv_day_shape=gv_day_shape,
+        rooftop_enabled=rooftop_enabled,
+        rooftop_existing_mwp=rooftop_existing_mwp, rooftop_ceiling_mwp=rooftop_ceiling_mwp,
+        rooftop_ramp_start_year=int(rooftop_ramp_start_year), rooftop_ramp_mwp_per_year=rooftop_ramp_mwp_per_year,
+        rooftop_self_consumption_pct=rooftop_self_consumption_pct,
     )
 
     pv_candidates = list(range(0, int(pv_max) + 1, int(pv_step)))
     bess_candidates = list(range(0, int(bess_max) + 1, int(bess_step)))
 
-    with st.spinner(f"Sizing {len(pv_candidates)}x{len(bess_candidates)} combinations x {len(tranche_years)} tranche years..."):
+    wind_search_note = f" x {len(wind_candidates)} wind sizes (at {int(wind_commissioning_year)} only)" if wind_candidates else ""
+    with st.spinner(f"Sizing {len(pv_candidates)}x{len(bess_candidates)} combinations{wind_search_note} "
+                     f"x {len(tranche_years)} tranche years..."):
         schedule, log = eng.size_tranche_schedule(
             tranche_years=tranche_years,
             pv_degradation_rate=pv_degradation_pct / 100,
@@ -211,6 +288,11 @@ if run_button:
             sim_kwargs=sim_kwargs,
             pv_capex_per_mwp=pv_capex_per_mwp, bess_capex_per_mwh=bess_capex_per_mwh,
             exogenous_tranches=exogenous_tranches,
+            target_overrides=target_overrides,
+            wind_candidates_mw=wind_candidates,
+            wind_degradation_rate=wind_degradation_pct / 100 if wind_enabled else 0.0,
+            wind_commissioning_year=int(wind_commissioning_year) if wind_enabled else None,
+            wind_capex_per_mw=wind_capex_per_mw,
         )
 
         years = list(range(2026, int(analysis_end_year) + 1))
@@ -240,7 +322,7 @@ if run_button:
                              bb_econ_cashflow=econ_cashflow, bb_econ_homer=econ_homer,
                              bb_re_target_2030=re_target_2030_pct / 100, bb_re_target_2050=re_target_2050_pct / 100,
                              bb_sim_kwargs=sim_kwargs, bb_years=years,
-                             bb_hourly_csv=None,  # cleared on every new Run - stale hourly export otherwise
+                             bb_hourly_xlsx=None,  # cleared on every new Run - stale hourly export otherwise
                              bb_done=True)
 
 # ==============================================================================
@@ -265,7 +347,9 @@ if st.session_state.get("bb_done"):
     st.subheader("Tranche sizing")
     log_rows = [{
         "Tranche Year": l["year"], "PV Added (MWp)": l["pv_add"], "BESS Added (MWh)": l["bess_add_mwh"],
-        "RE% at Commissioning": f"{l['re_pct']:.1f}%", "Target (+buffer)": f"{l['required_pct']:.1f}%",
+        "Wind Added (MW)": l.get("wind_add", 0),
+        "RE% at Commissioning": f"{l['re_pct']:.1f}%",
+        "Target": f"{l['required_pct']:.1f}%" + (" (override)" if l.get("override") else " (glide+buffer)"),
         "Curtailment %": f"{l['curtailment_pct']:.1f}%",
     } for l in log if l.get("status") == "OK"]
     if log_rows:
@@ -341,20 +425,30 @@ if st.session_state.get("bb_done"):
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.markdown("---")
-    st.subheader("Full hourly dispatch (every year, 8,760 hours each)")
-    st.caption("One row per hour per year - demand, PV/wind/OTEC generation, BESS charge/discharge/state of "
-               "charge, served, unmet and curtailment, all in MW (MWh for SOC). Matches this run's locked-in "
-               "tranche schedule. This is a large file (years × 8,760 rows) and takes a few seconds to build.")
-    if st.button("Generate hourly dispatch CSV"):
+    st.subheader("Full hourly dispatch (every year, one sheet per year)")
+    st.caption("One workbook, one sheet per year (Dispatch_2028, Dispatch_2030, ...), each with all 8,760 hours - "
+               "demand split into baseline + extra (EV/bus/marine/GV), Agri PV / wind / OTEC generation, the "
+               "intermittent penetration-cap mechanics (deficit before BESS, available for BESS charge), BESS "
+               "charge/discharge split before vs. after round-trip efficiency, state of charge (MWh and %), "
+               "residual diesel, curtailment, and a per-hour energy balance check column (should read ~0 every "
+               "hour - a non-zero value would flag a dispatch bug). Matches this run's locked-in tranche schedule. "
+               "Rooftop PV isn't its own column yet - see chat for why. This is a large file (years × 8,760 rows) "
+               "and takes a few seconds to build.")
+    if st.button("Generate hourly dispatch workbook"):
         with st.spinner("Simulating hourly dispatch for every year..."):
-            hourly_rows = eng.simulate_trajectory_hourly(
+            hourly_by_year = eng.simulate_trajectory_hourly(
                 schedule, st.session_state["bb_years"], **st.session_state["bb_sim_kwargs"]
             )
-            hourly_df = pd.DataFrame(hourly_rows)
-            st.session_state["bb_hourly_csv"] = hourly_df.to_csv(index=False)
-    if st.session_state.get("bb_hourly_csv"):
-        st.download_button("Download hourly dispatch (CSV)", data=st.session_state["bb_hourly_csv"],
-                            file_name="bora_bora_hourly_dispatch_all_years.csv", mime="text/csv")
+            hbuf = BytesIO()
+            with pd.ExcelWriter(hbuf, engine="openpyxl") as writer:
+                for year, rows in hourly_by_year.items():
+                    pd.DataFrame(rows).to_excel(writer, sheet_name=f"Dispatch_{year}", index=False)
+            st.session_state["bb_hourly_xlsx"] = hbuf.getvalue()
+    if st.session_state.get("bb_hourly_xlsx"):
+        st.download_button("Download hourly dispatch (Excel, one sheet per year)",
+                            data=st.session_state["bb_hourly_xlsx"],
+                            file_name="bora_bora_hourly_dispatch_by_year.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 else:
     st.info("Configure inputs in the sidebar, then click Run.")
