@@ -71,6 +71,18 @@ class TrancheSchedule:
 # HOURLY DISPATCH SIMULATION FOR ONE CALENDAR YEAR
 # ============================================================================
 
+def rooftop_capacity_mwp(year, existing_mwp, ceiling_mwp, ramp_start_year, ramp_mwp_per_year):
+    """Rooftop capacity is flat at `existing_mwp` through `ramp_start_year`, then
+    grows by `ramp_mwp_per_year` every year after that, capped at `ceiling_mwp`.
+    Matches the workbook's Forecast_Annual Total rooftop capacity row exactly
+    with the defaults (existing=2.357, ceiling=4.5, ramp_start_year=2025,
+    ramp_mwp_per_year=0.143): 2026->2.50, 2027->2.64, 2030->3.07, 2036->3.93,
+    reaching the 4.5 MWp ceiling by 2040."""
+    if year <= ramp_start_year:
+        return existing_mwp
+    return min(ceiling_mwp, existing_mwp + (year - ramp_start_year) * ramp_mwp_per_year)
+
+
 def simulate_year(
     year,
     schedule: TrancheSchedule,
@@ -85,11 +97,22 @@ def simulate_year(
     gv_annual_mwh, gv_commissioning_year, gv_day_shape,
     initial_soc_mwh=None,
     return_hourly=False,
+    rooftop_enabled=False,
+    rooftop_existing_mwp=0.0, rooftop_ceiling_mwp=0.0,
+    rooftop_ramp_start_year=2025, rooftop_ramp_mwp_per_year=0.0,
+    rooftop_self_consumption_pct=0.93,
 ):
     """Merit-order dispatch: PV -> Wind -> OTEC -> BESS discharge -> unmet
     (unmet = demand not covered by RE - implicitly the diesel-served
     fraction, since no diesel technology is modeled). Excess RE charges
     BESS up to its limits; anything left over is curtailed.
+
+    Rooftop (if enabled) contributes ONLY its exported-to-grid share
+    (1 - rooftop_self_consumption_pct) of its generation, using the same
+    hourly CF shape as pv_cf_hourly - the self-consumed share is already
+    netted out of `underlying_annual_table` upstream (Forecast_Annual's
+    "net of rooftop solar" row), so adding it again here would double-count
+    it. This mirrors the workbook's own Row 12/14 "exported to grid" split.
 
     `return_hourly=True` adds the full 8,760-hour arrays (demand, each
     technology's generation, BESS charge/discharge/SOC, unmet, curtailment)
@@ -110,6 +133,16 @@ def simulate_year(
     pv_gen = pv_mwac * pv_cf
     wind_gen = wind_mw * wind_cf
     otec_gen = np.full(HOURS, otec_mw * otec_cf)
+
+    # --- Rooftop: exported-to-grid share only (see docstring) ---
+    if rooftop_enabled:
+        rooftop_mwp = rooftop_capacity_mwp(year, rooftop_existing_mwp, rooftop_ceiling_mwp,
+                                            rooftop_ramp_start_year, rooftop_ramp_mwp_per_year)
+        rooftop_gen_raw = rooftop_mwp * pv_cf  # same solar CF shape as Agri PV
+        rooftop_gen_exported = rooftop_gen_raw * (1 - rooftop_self_consumption_pct)
+    else:
+        rooftop_mwp = 0.0
+        rooftop_gen_exported = np.zeros(HOURS)
 
     # --- demand: underlying (existing-development) + EV/marine + Grande Vaitape ---
     baseline_shape = np.array(baseline_demand_hourly_mw)
@@ -135,7 +168,7 @@ def simulate_year(
     # solar+wind - not a ceiling on total generation. Anything above that
     # limit goes to charge the BESS first, and is only curtailed if the BESS
     # is already full.
-    intermittent_gen = pv_gen + wind_gen
+    intermittent_gen = pv_gen + wind_gen + rooftop_gen_exported
     cap_limit = edt_penetration_cap * demand
     intermittent_to_grid = np.minimum(intermittent_gen, cap_limit)
     intermittent_excess_from_cap = intermittent_gen - intermittent_to_grid
@@ -153,8 +186,10 @@ def simulate_year(
 
     unmet = np.zeros(HOURS)
     curtailed_after_bess = np.zeros(HOURS)
-    bess_charge = np.zeros(HOURS)
-    bess_discharge = np.zeros(HOURS)
+    bess_charge = np.zeros(HOURS)              # AC-side power drawn to charge, BEFORE charging-efficiency loss
+    bess_charge_after_eff = np.zeros(HOURS)     # energy actually added to stored SOC, AFTER charging-efficiency loss
+    bess_discharge = np.zeros(HOURS)            # AC-side power delivered to grid, AFTER discharge-efficiency loss
+    bess_discharge_before_eff = np.zeros(HOURS)  # energy actually drawn out of stored SOC, BEFORE discharge-efficiency loss
     soc_hourly = np.zeros(HOURS)
 
     for h in range(HOURS):
@@ -164,16 +199,20 @@ def simulate_year(
         if shortfall > 0:
             max_discharge = min(bess_power_mw, soc * bess_discharge_eff)
             d = min(shortfall, max_discharge)
-            soc -= d / bess_discharge_eff if bess_discharge_eff > 0 else d
+            d_from_soc = d / bess_discharge_eff if bess_discharge_eff > 0 else d
+            soc -= d_from_soc
             bess_discharge[h] = d
+            bess_discharge_before_eff[h] = d_from_soc
             unmet[h] = shortfall - d
 
         if excess > 0:
             room = bess_energy_mwh - soc
             max_charge = min(bess_power_mw, room / bess_charge_eff if bess_charge_eff > 0 else room)
             c = min(excess, max_charge)
-            soc += c * bess_charge_eff
+            c_to_soc = c * bess_charge_eff
+            soc += c_to_soc
             bess_charge[h] = c
+            bess_charge_after_eff[h] = c_to_soc
             curtailed_after_bess[h] = excess - c
 
         soc = max(0.0, min(soc, bess_energy_mwh))
@@ -185,36 +224,58 @@ def simulate_year(
     total_curtailment = curtailed_after_bess.sum()
     re_pct = (total_served / total_demand * 100) if total_demand > 0 else 0
     unmet_pct = (total_unmet / total_demand * 100) if total_demand > 0 else 0
-    total_re_gen = pv_gen.sum() + wind_gen.sum() + otec_gen.sum()
+    total_re_gen = pv_gen.sum() + wind_gen.sum() + otec_gen.sum() + rooftop_gen_exported.sum()
     curtailment_pct_of_re_gen = (total_curtailment / total_re_gen * 100) if total_re_gen > 0 else 0
 
     result = {
         "year": year,
         "pv_mwp": pv_mwp, "pv_mwac": pv_mwac, "wind_mw": wind_mw,
         "otec_mw": otec_mw, "bess_power_mw": bess_power_mw, "bess_energy_mwh": bess_energy_mwh,
+        "rooftop_mwp": rooftop_mwp,
         "total_demand_mwh": total_demand, "total_served_mwh": total_served,
         "total_unmet_mwh": total_unmet, "unmet_pct": unmet_pct,
         "total_curtailment_mwh": total_curtailment,
         "curtailment_pct_of_re_gen": curtailment_pct_of_re_gen,
         "re_pct": re_pct,
         "pv_gen_mwh": pv_gen.sum(), "wind_gen_mwh": wind_gen.sum(), "otec_gen_mwh": otec_gen.sum(),
+        "rooftop_gen_exported_mwh": rooftop_gen_exported.sum(),
         "bess_discharge_mwh": bess_discharge.sum(), "bess_charge_mwh": bess_charge.sum(),
         "ending_soc_mwh": soc,
     }
 
     if return_hourly:
+        soc_pct = (soc_hourly / bess_energy_mwh * 100) if bess_energy_mwh > 0 else np.zeros(HOURS)
+        deficit_before_bess = np.maximum(net_load, 0.0)
+        # Energy balance check: total generation, minus whatever left the balance (BESS charge and
+        # curtailment), plus whatever entered it (BESS discharge and unmet/diesel), should equal demand
+        # exactly every hour - this should compute to ~0 (floating-point only) throughout; a persistent
+        # non-zero value would mean the dispatch logic has an energy-conservation bug.
+        balance_check = demand - (
+            pv_gen + wind_gen + otec_gen + rooftop_gen_exported
+            - bess_charge + bess_discharge - curtailed_after_bess + unmet
+        )
         result["hourly"] = {
             "hour": np.arange(HOURS),
+            "underlying_demand_mw": underlying_hourly_mw,
+            "extra_demand_mw": ev_marine_hourly_mw + gv_hourly_mw,
             "demand_mw": demand,
             "pv_gen_mw": pv_gen,
             "wind_gen_mw": wind_gen,
             "otec_gen_mw": otec_gen,
-            "bess_charge_mw": bess_charge,
-            "bess_discharge_mw": bess_discharge,
+            "rooftop_gen_mw": rooftop_gen_exported,
+            "intermittent_raw_mw": intermittent_gen,
+            "deficit_before_bess_mw": deficit_before_bess,
+            "available_for_bess_charge_mw": total_excess_for_bess,
+            "bess_charge_before_eff_mw": bess_charge,
+            "bess_charge_after_eff_mw": bess_charge_after_eff,
+            "bess_discharge_after_eff_mw": bess_discharge,
+            "bess_discharge_before_eff_mw": bess_discharge_before_eff,
             "soc_mwh": soc_hourly,
+            "soc_pct": soc_pct,
             "unmet_mw": unmet,
             "curtailment_mw": curtailed_after_bess,
             "served_mw": demand - unmet,
+            "balance_check_mw": balance_check,
         }
 
     return result
@@ -231,35 +292,68 @@ def simulate_trajectory(schedule: TrancheSchedule, years, **sim_kwargs):
     return results
 
 
+_MONTH_DAY_COUNTS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]  # non-leap 365-day calendar
+
+
+def _month_day_hour_for_hour_of_year(hour_of_year):
+    """Maps a 0-based hour-of-year (0..8759, non-leap 365-day calendar) to
+    (month 1-12, day 1-31, hour_of_day 0-23), for the Month/Day/Hour of Day
+    columns in the per-year dispatch sheets."""
+    day_of_year = hour_of_year // 24  # 0-based
+    hour_of_day = hour_of_year % 24
+    remaining = day_of_year
+    for month_index, days_in_month in enumerate(_MONTH_DAY_COUNTS, start=1):
+        if remaining < days_in_month:
+            return month_index, remaining + 1, hour_of_day
+        remaining -= days_in_month
+    return 12, 31, hour_of_day  # unreachable given exactly 365 days, kept as a safe fallback
+
+
 def simulate_trajectory_hourly(schedule: TrancheSchedule, years, **sim_kwargs):
-    """Like simulate_trajectory, but returns one row per (year, hour) with
-    the full dispatch detail - demand, each technology's generation, BESS
-    charge/discharge/SOC, unmet and curtailment, in MW for every hour of
-    every year. Use for a detailed year-by-year dispatch review; this is
-    ~8,760 rows per year, so only call it once per schedule (not inside a
-    sizing search)."""
-    rows = []
+    """Like simulate_trajectory, but returns the full 8,760-hour dispatch
+    detail for every year, keyed by year: {year: [row_dict, ...]}. Each
+    year's rows are meant for their own sheet (Dispatch_<year>), mirroring
+    the source Excel workbook's Dispatch_2028/2030/2035/... sheet-per-year
+    layout, with matching column names. Use for a detailed year-by-year
+    dispatch review; this is ~8,760 rows per year, so only call it once per
+    schedule (not inside a sizing search)."""
+    by_year = {}
     soc = None
     for year in years:
         r = simulate_year(year, schedule, initial_soc_mwh=soc, return_hourly=True, **sim_kwargs)
         soc = r["ending_soc_mwh"]
         h = r["hourly"]
         n = len(h["hour"])
+        rows = []
         for i in range(n):
+            month, day, hour_of_day = _month_day_hour_for_hour_of_year(i)
             rows.append({
-                "year": year, "hour": int(h["hour"][i]),
-                "demand_mw": h["demand_mw"][i],
-                "pv_gen_mw": h["pv_gen_mw"][i],
-                "wind_gen_mw": h["wind_gen_mw"][i],
-                "otec_gen_mw": h["otec_gen_mw"][i],
-                "bess_charge_mw": h["bess_charge_mw"][i],
-                "bess_discharge_mw": h["bess_discharge_mw"][i],
-                "soc_mwh": h["soc_mwh"][i],
-                "served_mw": h["served_mw"][i],
-                "unmet_mw": h["unmet_mw"][i],
-                "curtailment_mw": h["curtailment_mw"][i],
+                "Hour": i + 1,
+                "Month": month,
+                "Day": day,
+                "Hour of day": hour_of_day,
+                "Baseline demand scaled (MW)": h["underlying_demand_mw"][i],
+                "Extra demand: EV+Bus+Marine+GV (MW)": h["extra_demand_mw"][i],
+                "Total demand (MW)": h["demand_mw"][i],
+                "Rooftop gen (MW)": h["rooftop_gen_mw"][i],
+                "Agri gen (MW)": h["pv_gen_mw"][i],
+                "Wind gen (MW)": h["wind_gen_mw"][i],
+                "OTEC gen (MW)": h["otec_gen_mw"][i],
+                "Intermittent raw (MW)": h["intermittent_raw_mw"][i],
+                "Deficit before BESS (MW)": h["deficit_before_bess_mw"][i],
+                "Available for BESS charge (MW)": h["available_for_bess_charge_mw"][i],
+                "BESS charge before eff (MWh)": h["bess_charge_before_eff_mw"][i],
+                "BESS charge after eff (MWh)": h["bess_charge_after_eff_mw"][i],
+                "BESS discharge after eff (MWh)": h["bess_discharge_after_eff_mw"][i],
+                "BESS discharge before eff (MWh)": h["bess_discharge_before_eff_mw"][i],
+                "SoC (MWh)": h["soc_mwh"][i],
+                "SoC (%)": h["soc_pct"][i],
+                "Residual diesel (MW)": h["unmet_mw"][i],
+                "Curtailment (MW)": h["curtailment_mw"][i],
+                "Energy balance check (MW)": h["balance_check_mw"][i],
             })
-    return rows
+        by_year[year] = rows
+    return by_year
 
 
 # ============================================================================
@@ -410,62 +504,95 @@ def size_tranche_schedule(
     pv_capex_per_mwp, bess_capex_per_mwh,  # used only to rank candidates within a tranche year (cheapest first)
     exogenous_tranches=None,   # list of Tranche objects to seed the schedule with (OTEC, Wind if enabled)
     unmet_load_ceiling_pct=100.0,
+    target_overrides=None,   # optional {year: required_pct} - pins an exact required RE% at that
+                              # tranche year, bypassing the glide-path+buffer calculation for that
+                              # year only; every other tranche year is unaffected.
+    wind_candidates_mw=None,      # None/[] -> wind is not optimized (any wind capacity must be
+                                   # passed in via exogenous_tranches instead, as a fixed input)
+    wind_degradation_rate=0.0,
+    wind_commissioning_year=None,  # the ONE tranche year at which wind is sized (wind is a single
+                                    # one-time build per the locked assumption, not re-tranched like
+                                    # PV/BESS) - must be one of tranche_years for the search to run there
+    wind_capex_per_mw=0.0,
     verbose=False,
 ):
     """Greedy sequential sizing: at each tranche year, grid-search the
     minimum-cost (PV, BESS) addition that satisfies the RE floor (target +
-    buffer) at that checkpoint year while respecting the curtailment cap,
-    given all previously-locked tranches (now degraded to that year).
+    buffer, or an explicit override) at that checkpoint year while
+    respecting the curtailment cap, given all previously-locked tranches
+    (now degraded to that year).
     """
     schedule = TrancheSchedule()
     for t in (exogenous_tranches or []):
         getattr(schedule, t.technology).append(t)
 
     log = []
+    target_overrides = target_overrides or {}
+    wind_candidates_mw = wind_candidates_mw or []
 
     for ty in tranche_years:
-        target_pct = re_target_for_year(ty, re_target_2030, re_target_2050) * 100
-        required_pct = target_pct + (target_buffer_pct if ty < 2050 else 0.0)
+        if ty in target_overrides:
+            required_pct = target_overrides[ty]
+            target_pct = required_pct
+            is_override = True
+        else:
+            target_pct = re_target_for_year(ty, re_target_2030, re_target_2050) * 100
+            required_pct = target_pct + (target_buffer_pct if ty < 2050 else 0.0)
+            is_override = False
+
+        # Wind is a single one-time build (locked assumption), so it's only searched at its own
+        # commissioning year - every other tranche year gets a 1-element [0] "no wind here" list,
+        # which keeps the search 2D (PV x BESS) everywhere except that one year.
+        wind_candidates_this_year = wind_candidates_mw if (wind_candidates_mw and ty == wind_commissioning_year) else [0]
 
         best = None
         for pv_add in pv_candidates_mwp:
             for bess_add_mwh in bess_candidates_mwh:
-                trial = schedule.clone()
-                if pv_add > 0:
-                    trial.pv.append(Tranche("pv", ty, pv_degradation_rate, capacity_mw=pv_add))
-                if bess_add_mwh > 0:
-                    trial.bess.append(Tranche("bess", ty, bess_degradation_rate,
-                                               power_mw=bess_add_mwh * bess_c_rate, energy_mwh=bess_add_mwh))
+                for wind_add in wind_candidates_this_year:
+                    trial = schedule.clone()
+                    if pv_add > 0:
+                        trial.pv.append(Tranche("pv", ty, pv_degradation_rate, capacity_mw=pv_add))
+                    if bess_add_mwh > 0:
+                        trial.bess.append(Tranche("bess", ty, bess_degradation_rate,
+                                                   power_mw=bess_add_mwh * bess_c_rate, energy_mwh=bess_add_mwh))
+                    if wind_add > 0:
+                        trial.wind.append(Tranche("wind", ty, wind_degradation_rate, capacity_mw=wind_add))
 
-                r = simulate_year(ty, trial, **sim_kwargs)
+                    r = simulate_year(ty, trial, **sim_kwargs)
 
-                feasible = (r["re_pct"] >= required_pct
-                            and r["unmet_pct"] <= unmet_load_ceiling_pct
-                            and r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct)
-                if not feasible:
-                    continue
+                    feasible = (r["re_pct"] >= required_pct
+                                and r["unmet_pct"] <= unmet_load_ceiling_pct
+                                and r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct)
+                    if not feasible:
+                        continue
 
-                # simple capital-cost proxy for ranking candidates within one tranche year
-                # (full NPC/LCOE across the whole schedule is computed once, separately,
-                # after the schedule is locked in - see compute_lifecycle_economics)
-                cost_proxy = pv_add * pv_capex_per_mwp + bess_add_mwh * bess_capex_per_mwh
-                if best is None or cost_proxy < best["cost_proxy"]:
-                    best = {"pv_add": pv_add, "bess_add_mwh": bess_add_mwh, "cost_proxy": cost_proxy,
-                            "re_pct": r["re_pct"], "unmet_pct": r["unmet_pct"],
-                            "curtailment_pct": r["curtailment_pct_of_re_gen"]}
+                    # simple capital-cost proxy for ranking candidates within one tranche year
+                    # (full NPC/LCOE across the whole schedule is computed once, separately,
+                    # after the schedule is locked in - see compute_lifecycle_economics)
+                    cost_proxy = (pv_add * pv_capex_per_mwp + bess_add_mwh * bess_capex_per_mwh
+                                  + wind_add * wind_capex_per_mw)
+                    if best is None or cost_proxy < best["cost_proxy"]:
+                        best = {"pv_add": pv_add, "bess_add_mwh": bess_add_mwh, "wind_add": wind_add,
+                                "cost_proxy": cost_proxy,
+                                "re_pct": r["re_pct"], "unmet_pct": r["unmet_pct"],
+                                "curtailment_pct": r["curtailment_pct_of_re_gen"]}
 
         if best is None:
-            log.append({"year": ty, "status": "INFEASIBLE", "target_pct": target_pct, "required_pct": required_pct})
+            log.append({"year": ty, "status": "INFEASIBLE", "target_pct": target_pct,
+                        "required_pct": required_pct, "override": is_override})
             if verbose:
                 print(f"[{ty}] INFEASIBLE at target {required_pct:.1f}% - widen PV/BESS candidate ranges.")
             continue
 
         if best["pv_add"] > 0:
             schedule.pv.append(Tranche("pv", ty, pv_degradation_rate, capacity_mw=best["pv_add"]))
+        if best.get("wind_add", 0) > 0:
+            schedule.wind.append(Tranche("wind", ty, wind_degradation_rate, capacity_mw=best["wind_add"]))
         if best["bess_add_mwh"] > 0:
             schedule.bess.append(Tranche("bess", ty, bess_degradation_rate,
                                           power_mw=best["bess_add_mwh"] * bess_c_rate, energy_mwh=best["bess_add_mwh"]))
 
-        log.append({"year": ty, "status": "OK", **best, "target_pct": target_pct, "required_pct": required_pct})
+        log.append({"year": ty, "status": "OK", **best, "target_pct": target_pct,
+                    "required_pct": required_pct, "override": is_override})
 
     return schedule, log
