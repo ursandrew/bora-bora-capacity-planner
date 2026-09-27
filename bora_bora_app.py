@@ -69,24 +69,23 @@ with st.sidebar:
         wind_enabled = st.checkbox("Include wind", value=False)
         wind_sizing_mode = st.radio("Wind sizing", ["Fixed capacity", "Optimize capacity"],
                                      disabled=not wind_enabled, horizontal=True,
-                                     help="Fixed: you set the MW directly (today's behaviour). Optimize: the sizing "
-                                          "search picks the cheapest wind MW (from the range below) jointly with "
-                                          "PV+BESS, at wind's own commissioning year only - wind is a single "
-                                          "one-time build, not re-tranched like PV/BESS at every checkpoint.")
-        wind_commissioning_year = st.number_input("Commissioning year", value=2028, step=1, disabled=not wind_enabled)
+                                     help="Fixed: you set the MW and commissioning year directly (a single one-time "
+                                          "build). Optimize: wind is searched at EVERY tranche year, exactly like "
+                                          "PV+BESS - it can be added at more than one tranche year if that's "
+                                          "cheapest, each addition its own vintage-tracked block.")
         wind_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.5, step=0.1, disabled=not wind_enabled)
         if wind_sizing_mode == "Fixed capacity":
+            wind_commissioning_year = st.number_input("Commissioning year", value=2028, step=1, disabled=not wind_enabled)
             wind_mw = st.number_input("Capacity (MW)", value=4.125, step=0.1, disabled=not wind_enabled)
             wind_min_mw, wind_max_mw, wind_step_mw = None, None, None
         else:
-            wind_mw = None
+            wind_commissioning_year, wind_mw = None, None
             c1, c2, c3 = st.columns(3)
-            wind_min_mw = c1.number_input("Min (MW)", value=0.0, step=0.5, disabled=not wind_enabled)
-            wind_max_mw = c2.number_input("Max (MW)", value=10.0, step=0.5, disabled=not wind_enabled)
+            wind_min_mw = c1.number_input("Min per tranche year (MW)", value=0.0, step=0.5, disabled=not wind_enabled)
+            wind_max_mw = c2.number_input("Max per tranche year (MW)", value=5.0, step=0.5, disabled=not wind_enabled)
             wind_step_mw = c3.number_input("Step (MW)", value=1.0, step=0.5, disabled=not wind_enabled)
-            st.caption("Adds a 3rd search dimension (PV x BESS x Wind) at the commissioning year above only - "
-                       "materially slower than PV+BESS alone. If that year isn't already in 'Tranche years', "
-                       "it's added automatically so the search has somewhere to size wind.")
+            st.caption("Adds a 3rd search dimension (PV x BESS x Wind) at EVERY tranche year - materially slower "
+                       "than PV+BESS alone, and slower again the more tranche years you list.")
         wind_cf_upload = st.file_uploader("Hourly generation-factor profile (CSV) - required if wind is included", type=["csv"],
                                            key="wind_upload", disabled=not wind_enabled)
         st.download_button("Download blank template", data.wind_cf_template_csv(), "wind_cf_template.csv", key="wind_tmpl")
@@ -105,6 +104,16 @@ with st.sidebar:
         bess_charge_eff = st.number_input("Charge efficiency", value=0.95, min_value=0.5, max_value=1.0, step=0.01)
         bess_discharge_eff = st.number_input("Discharge efficiency", value=0.95, min_value=0.5, max_value=1.0, step=0.01)
         bess_degradation_pct = st.number_input("Degradation rate (%/yr)", value=1.5, step=0.1)
+        c1, c2, c3 = st.columns(3)
+        bess_initial_soc_pct = c1.number_input("Initial SoC at commissioning (%)", value=50.0, min_value=0.0,
+                                                max_value=100.0, step=1.0)
+        bess_min_soc_pct = c2.number_input("Min SoC (%)", value=5.0, min_value=0.0, max_value=100.0, step=1.0)
+        bess_max_soc_pct = c3.number_input("Max SoC (%)", value=95.0, min_value=0.0, max_value=100.0, step=1.0)
+        st.caption("A new BESS tranche starts at Initial SoC (of its own added capacity) when it commissions; "
+                   "any capacity already online keeps whatever charge it already had. Every hour, charge/discharge "
+                   "is kept within [Min SoC, Max SoC] of that year's total BESS capacity.")
+        if bess_min_soc_pct >= bess_max_soc_pct:
+            st.warning("Min SoC should be less than Max SoC - fix this before running.")
 
     # --- Demand: baseline ---------------------------------------------
     with st.expander("🏝️ Demand — existing development (baseline)", expanded=False):
@@ -196,6 +205,9 @@ with st.sidebar:
 # RUN
 # ==============================================================================
 if run_button:
+    if bess_min_soc_pct >= bess_max_soc_pct:
+        st.error("BESS Min SoC must be less than Max SoC.")
+        st.stop()
     try:
         with st.spinner("Loading data..."):
             pv_cf = data.load_pv_cf(pv_cf_upload)
@@ -219,10 +231,6 @@ if run_button:
     tranche_years = tuple(int(y.strip()) for y in tranche_years_str.split(",") if y.strip())
 
     wind_optimize = wind_enabled and wind_sizing_mode == "Optimize capacity"
-    if wind_optimize and int(wind_commissioning_year) not in tranche_years:
-        tranche_years = tuple(sorted(set(tranche_years) | {int(wind_commissioning_year)}))
-        st.info(f"Wind's commissioning year {int(wind_commissioning_year)} was added to Tranche years so the "
-                f"search has a year to size it at.")
 
     target_overrides = {}
     for pair in target_overrides_str.split(","):
@@ -270,12 +278,14 @@ if run_button:
         rooftop_existing_mwp=rooftop_existing_mwp, rooftop_ceiling_mwp=rooftop_ceiling_mwp,
         rooftop_ramp_start_year=int(rooftop_ramp_start_year), rooftop_ramp_mwp_per_year=rooftop_ramp_mwp_per_year,
         rooftop_self_consumption_pct=rooftop_self_consumption_pct,
+        bess_initial_soc_frac=bess_initial_soc_pct / 100,
+        bess_min_soc_frac=bess_min_soc_pct / 100, bess_max_soc_frac=bess_max_soc_pct / 100,
     )
 
     pv_candidates = list(range(0, int(pv_max) + 1, int(pv_step)))
     bess_candidates = list(range(0, int(bess_max) + 1, int(bess_step)))
 
-    wind_search_note = f" x {len(wind_candidates)} wind sizes (at {int(wind_commissioning_year)} only)" if wind_candidates else ""
+    wind_search_note = f" x {len(wind_candidates)} wind sizes (every tranche year)" if wind_candidates else ""
     with st.spinner(f"Sizing {len(pv_candidates)}x{len(bess_candidates)} combinations{wind_search_note} "
                      f"x {len(tranche_years)} tranche years..."):
         schedule, log = eng.size_tranche_schedule(
@@ -291,7 +301,6 @@ if run_button:
             target_overrides=target_overrides,
             wind_candidates_mw=wind_candidates,
             wind_degradation_rate=wind_degradation_pct / 100 if wind_enabled else 0.0,
-            wind_commissioning_year=int(wind_commissioning_year) if wind_enabled else None,
             wind_capex_per_mw=wind_capex_per_mw,
         )
 
