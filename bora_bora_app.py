@@ -93,10 +93,16 @@ with st.sidebar:
     # --- OTEC -------------------------------------------------------------
     with st.expander("🌊 OTEC", expanded=True):
         otec_enabled = st.checkbox("Include OTEC", value=True)
-        otec_mw = st.number_input("Capacity (MW, net average delivered)", value=1.2, step=0.1, disabled=not otec_enabled)
-        otec_cf = st.number_input("Capacity factor", value=1.0, min_value=0.0, max_value=1.0, step=0.01, disabled=not otec_enabled)
-        otec_commissioning_year = st.number_input("Commissioning year", value=2032, step=1, disabled=not otec_enabled)
-        otec_degradation_pct = st.number_input("Degradation rate (%/yr)", value=0.0, step=0.1, disabled=not otec_enabled)
+        otec_schedule_str = st.text_input(
+            "OTEC schedule (format 'year:mw', comma-separated - each entry is its own vintage tranche)",
+            "2032:1.2", disabled=not otec_enabled)
+        st.caption("Each 'year:mw' entry commissions that much ADDITIONAL OTEC capacity in that year, stacking on "
+                   "top of whatever OTEC is already online (own vintage/degradation clock, same as PV/BESS "
+                   "tranches). Example: '2032:1.2, 2037:1.4, 2042:1.2, 2047:1.2' stages OTEC across four "
+                   "milestones instead of one fixed build - independent of the PV/BESS tranche years below, so "
+                   "you can lean on staged OTEC without re-sizing PV/BESS at those same years.")
+        otec_cf = st.number_input("Capacity factor (applies to every OTEC tranche)", value=1.0, min_value=0.0, max_value=1.0, step=0.01, disabled=not otec_enabled)
+        otec_degradation_pct = st.number_input("Degradation rate (%/yr, applies to every OTEC tranche)", value=0.0, step=0.1, disabled=not otec_enabled)
 
     # --- BESS -------------------------------------------------------------
     with st.expander("🔋 BESS", expanded=False):
@@ -154,7 +160,16 @@ with st.sidebar:
         re_target_2050_pct = st.number_input("RE target, 2050 (%)", value=100.0, step=1.0)
         tranche_years_str = st.text_input("Tranche years (comma-separated)", "2028, 2030, 2035, 2040, 2050")
         target_buffer_pct = st.slider("Buffer at commissioning (percentage points)", 0.0, 15.0, 3.0, 0.5)
-        curtailment_cap_pct = st.slider("Max curtailment (% of PV+Wind+OTEC generation)", 1.0, 30.0, 10.0, 1.0)
+        enforce_curtailment_cap = st.checkbox(
+            "Enforce a max-curtailment gate on the PV/BESS/wind sizing search", value=True,
+            help="The RE%/unmet% target above is always the real (legally-driven) constraint. This curtailment "
+                 "gate is an extra cost/efficiency guardrail on top of it, not a requirement of the project - "
+                 "turn it off when a fixed OTEC schedule is already meeting the RE target on its own and you "
+                 "don't want the search reporting 'INFEASIBLE' just because curtailment is high.")
+        curtailment_cap_pct = st.slider("Max curtailment (% of PV+Wind+OTEC generation)", 1.0, 100.0, 30.0, 1.0,
+                                         disabled=not enforce_curtailment_cap)
+        if not enforce_curtailment_cap:
+            curtailment_cap_pct = 100.0
         target_overrides_str = st.text_input(
             "Target overrides per tranche year (optional, format 'year:pct', comma-separated)", "")
         st.caption("Pins an exact required RE% at one specific tranche year, replacing the glide-path+buffer "
@@ -247,10 +262,29 @@ if run_button:
             st.error(f"Target override '{pair}' isn't in 'year:pct' format.")
             st.stop()
 
-    exogenous_tranches = []
+    otec_schedule = []
     if otec_enabled:
-        exogenous_tranches.append(eng.Tranche("otec", int(otec_commissioning_year), otec_degradation_pct / 100,
-                                               capacity_mw=otec_mw))
+        for pair in otec_schedule_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if ":" not in pair:
+                st.error(f"OTEC schedule entry '{pair}' isn't in 'year:mw' format.")
+                st.stop()
+            y_str, mw_str = pair.split(":", 1)
+            try:
+                otec_schedule.append((int(y_str.strip()), float(mw_str.strip())))
+            except ValueError:
+                st.error(f"OTEC schedule entry '{pair}' isn't in 'year:mw' format.")
+                st.stop()
+        if not otec_schedule:
+            st.error("OTEC is included but no schedule entries were given - add at least one 'year:mw' entry.")
+            st.stop()
+
+    exogenous_tranches = []
+    for otec_year, otec_mw_add in otec_schedule:
+        exogenous_tranches.append(eng.Tranche("otec", otec_year, otec_degradation_pct / 100,
+                                               capacity_mw=otec_mw_add))
     if wind_enabled and not wind_optimize:
         exogenous_tranches.append(eng.Tranche("wind", int(wind_commissioning_year), wind_degradation_pct / 100,
                                                capacity_mw=wind_mw))
