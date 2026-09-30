@@ -536,6 +536,16 @@ def size_tranche_schedule(
                                    # PV/BESS - each addition becomes its own vintage-tracked tranche.
     wind_degradation_rate=0.0,
     wind_capex_per_mw=0.0,
+    pv_om_per_mwp_yr=0.0, bess_om_per_mwh_yr=0.0, wind_om_per_mw_yr=0.0,  # for the per-candidate
+                              # CAPEX/OPEX/LCOE-proxy columns in `trials` - purely informational,
+                              # do not affect which candidate is chosen (the search still ranks by
+                              # cost_proxy = CAPEX only, see below).
+    lcoe_discount_rate=0.08, pv_lifetime=25, bess_lifetime=15, wind_lifetime=20,  # annualizes each
+                              # candidate's own CAPEX (via CRF) for the LCOE-proxy column only.
+    record_trials=True,      # when True (default), every candidate combination tried - feasible or
+                              # not - is recorded and returned as a third value `trials`, for full
+                              # grid-search transparency (see docstring). Set False to skip this and
+                              # save a little memory/time on very large grids.
     verbose=False,
 ):
     """Greedy sequential sizing: at each tranche year, grid-search the
@@ -545,14 +555,32 @@ def size_tranche_schedule(
     given all previously-locked tranches (now degraded to that year). With
     wind included, the search is 3D (PV x BESS x Wind) at every tranche
     year, not just PV x BESS - materially slower.
+
+    Returns (schedule, log, trials):
+      - schedule: the final TrancheSchedule with only the winning addition
+        locked in at each tranche year.
+      - log: one entry per tranche year, same as before (status, winning
+        combo, target used).
+      - trials: (when record_trials=True) one row per (tranche_year, PV, BESS,
+        Wind) combination the search actually evaluated - the full grid, not
+        just the winner - each with its RE%/unmet%/curtailment%, this
+        candidate's own incremental CAPEX/OPEX/annualized-LCOE-proxy, and
+        three boolean columns (re_target_met, unmet_ceiling_met,
+        curtailment_cap_met) plus the combined `feasible` and whether it's
+        the one actually `selected`. This is what full grid-search
+        transparency (e.g. "would 24 MWp/80 MWh have worked? what about
+        22 MWp/90 MWh?") is answered from directly, row by row, rather than
+        by re-running anything.
     """
     schedule = TrancheSchedule()
     for t in (exogenous_tranches or []):
         getattr(schedule, t.technology).append(t)
 
     log = []
+    trials = []
     target_overrides = target_overrides or {}
     wind_candidates_mw = wind_candidates_mw or []
+    iteration = 0
 
     for ty in tranche_years:
         if ty in target_overrides:
@@ -570,6 +598,7 @@ def size_tranche_schedule(
         wind_candidates_this_year = wind_candidates_mw if wind_candidates_mw else [0]
 
         best = None
+        best_trial_index = None
         for pv_add in pv_candidates_mwp:
             for bess_add_mwh in bess_candidates_mwh:
                 for wind_add in wind_candidates_this_year:
@@ -584,22 +613,60 @@ def size_tranche_schedule(
 
                     r = simulate_year(ty, trial, **sim_kwargs)
 
-                    feasible = (r["re_pct"] >= required_pct
-                                and r["unmet_pct"] <= unmet_load_ceiling_pct
-                                and r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct)
-                    if not feasible:
-                        continue
+                    re_target_met = r["re_pct"] >= required_pct
+                    unmet_ceiling_met = r["unmet_pct"] <= unmet_load_ceiling_pct
+                    curtailment_cap_met = r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct
+                    feasible = re_target_met and unmet_ceiling_met and curtailment_cap_met
 
                     # simple capital-cost proxy for ranking candidates within one tranche year
                     # (full NPC/LCOE across the whole schedule is computed once, separately,
                     # after the schedule is locked in - see compute_lifecycle_economics)
-                    cost_proxy = (pv_add * pv_capex_per_mwp + bess_add_mwh * bess_capex_per_mwh
-                                  + wind_add * wind_capex_per_mw)
-                    if best is None or cost_proxy < best["cost_proxy"]:
+                    capex_add = (pv_add * pv_capex_per_mwp + bess_add_mwh * bess_capex_per_mwh
+                                 + wind_add * wind_capex_per_mw)
+                    opex_add = (pv_add * pv_om_per_mwp_yr + bess_add_mwh * bess_om_per_mwh_yr
+                                + wind_add * wind_om_per_mw_yr)
+                    # Candidate LCOE PROXY: this candidate's own CAPEX annualized over its own
+                    # lifetime (via CRF) plus its OPEX, divided by THIS YEAR's total served energy.
+                    # This is NOT the whole-system lifecycle LCOE (that needs the full multi-year
+                    # schedule and is computed once, separately, via compute_lifecycle_economics) -
+                    # it's a same-year, per-candidate proxy meant only for comparing candidates
+                    # against each other on a consistent $/MWh basis.
+                    annualized_capex = (pv_add * pv_capex_per_mwp * crf(lcoe_discount_rate, pv_lifetime)
+                                         + bess_add_mwh * bess_capex_per_mwh * crf(lcoe_discount_rate, bess_lifetime)
+                                         + wind_add * wind_capex_per_mw * crf(lcoe_discount_rate, wind_lifetime))
+                    lcoe_proxy = ((annualized_capex + opex_add) / r["total_served_mwh"]
+                                  if r["total_served_mwh"] > 0 else 0.0)
+
+                    if record_trials:
+                        iteration += 1
+                        trials.append({
+                            "iteration": iteration, "tranche_year": ty,
+                            "pv_add_mwp": pv_add, "bess_add_mwh": bess_add_mwh, "wind_add_mw": wind_add,
+                            "capex_add": capex_add, "opex_add_per_yr": opex_add,
+                            "lcoe_proxy_per_mwh": lcoe_proxy,
+                            "re_pct": r["re_pct"], "unmet_pct": r["unmet_pct"],
+                            "curtailment_pct": r["curtailment_pct_of_re_gen"],
+                            "required_pct": required_pct,
+                            "re_target_met": re_target_met,
+                            "unmet_ceiling_met": unmet_ceiling_met,
+                            "curtailment_cap_met": curtailment_cap_met,
+                            "feasible": feasible,
+                            "selected": False,   # back-filled to True on the winning row once known
+                        })
+
+                    if not feasible:
+                        continue
+
+                    if best is None or capex_add < best["cost_proxy"]:
                         best = {"pv_add": pv_add, "bess_add_mwh": bess_add_mwh, "wind_add": wind_add,
-                                "cost_proxy": cost_proxy,
+                                "cost_proxy": capex_add,
                                 "re_pct": r["re_pct"], "unmet_pct": r["unmet_pct"],
                                 "curtailment_pct": r["curtailment_pct_of_re_gen"]}
+                        if record_trials:
+                            best_trial_index = len(trials) - 1
+
+        if record_trials and best_trial_index is not None:
+            trials[best_trial_index]["selected"] = True
 
         if best is None:
             log.append({"year": ty, "status": "INFEASIBLE", "target_pct": target_pct,
@@ -619,4 +686,4 @@ def size_tranche_schedule(
         log.append({"year": ty, "status": "OK", **best, "target_pct": target_pct,
                     "required_pct": required_pct, "override": is_override})
 
-    return schedule, log
+    return schedule, log, trials
