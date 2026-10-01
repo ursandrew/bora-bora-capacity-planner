@@ -352,21 +352,14 @@ if run_button:
             otec_capex_per_mw=otec_capex_per_mw, otec_om_per_mw_yr=otec_om_per_mw_yr,
             bess_capex_per_mwh=bess_capex_per_mwh, bess_om_per_mwh_yr=bess_om_per_mwh_yr,
         )
-        lifetimes = dict(pv=pv_lifetime, wind=wind_lifetime, otec=otec_lifetime, bess=bess_lifetime)
-
-        econ_cashflow = eng.compute_lifecycle_economics(
-            schedule, traj_df, unit_costs, lifetimes,
+        econ = eng.compute_lifecycle_economics(
+            schedule, traj_df, unit_costs,
             nominal_discount_rate_pct / 100, inflation_rate_pct / 100,
-            2026, int(analysis_end_year), method="cashflow",
-        )
-        econ_homer = eng.compute_lifecycle_economics(
-            schedule, traj_df, unit_costs, lifetimes,
-            nominal_discount_rate_pct / 100, inflation_rate_pct / 100,
-            2026, int(analysis_end_year), method="homer",
+            2026, int(analysis_end_year),
         )
 
     st.session_state.update(bb_schedule=schedule, bb_log=log, bb_traj_df=traj_df, bb_trials=trials,
-                             bb_econ_cashflow=econ_cashflow, bb_econ_homer=econ_homer,
+                             bb_econ=econ,
                              bb_re_target_2030=re_target_2030_pct / 100, bb_re_target_2050=re_target_2050_pct / 100,
                              bb_sim_kwargs=sim_kwargs, bb_years=years,
                              bb_hourly_xlsx=None,  # cleared on every new Run - stale hourly export otherwise
@@ -381,8 +374,7 @@ if st.session_state.get("bb_done"):
     traj_df = st.session_state["bb_traj_df"]
     trials = st.session_state.get("bb_trials", [])
     trials_df = pd.DataFrame(trials) if trials else pd.DataFrame()
-    econ_cf = st.session_state["bb_econ_cashflow"]
-    econ_hm = st.session_state["bb_econ_homer"]
+    econ = st.session_state["bb_econ"]
     re_2030 = st.session_state["bb_re_target_2030"]
     re_2050 = st.session_state["bb_re_target_2050"]
 
@@ -442,22 +434,28 @@ if st.session_state.get("bb_done"):
 
     st.markdown("---")
     st.subheader("Economics")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("NPC — HOMER method", f"${econ_hm['npv_cost']/1e6:.2f}M")
-    col2.metric("LCOE — HOMER method", f"${econ_hm['lcoe_per_mwh']:.2f}/MWh")
-    col3.metric("NPC — Cash-flow method", f"${econ_cf['npv_cost']/1e6:.2f}M")
-    col4.metric("LCOE — Cash-flow method", f"${econ_cf['lcoe_per_mwh']:.2f}/MWh")
+    st.caption("NPV(costs) / NPV(energy-served), both discounted at the nominal discount rate. "
+               "CAPEX is booked once at each tranche's own commissioning year (no replacement); "
+               "O&M escalates with inflation. Verified against the FDDA reference LCOE model.")
+    col1, col2 = st.columns(2)
+    col1.metric("NPC (lifecycle)", f"${econ['npv_cost']/1e6:.2f}M")
+    col2.metric("LCOE", f"${econ['lcoe_per_mwh']:.2f}/MWh")
 
-    comp_rows = [
-        ["Discount rate", "Real", "Nominal"],
-        ["O&M treatment", "Constant (real terms)", "Escalates with inflation"],
-        ["Replacement", "Modeled at each tranche's own lifetime", "Not modeled"],
-        ["Salvage", "Included (prorated remaining life)", "Not modeled"],
-        ["NPC ($M)", f"{econ_hm['npv_cost']/1e6:.2f}", f"{econ_cf['npv_cost']/1e6:.2f}"],
-        ["LCOE ($/MWh)", f"{econ_hm['lcoe_per_mwh']:.2f}", f"{econ_cf['lcoe_per_mwh']:.2f}"],
+    tech_labels = {"pv": "PV", "wind": "Wind", "otec": "OTEC", "bess": "BESS"}
+    contrib_rows = [
+        {"Technology": tech_labels[tech], "Lifecycle cost ($M)": econ["cost_by_technology"][tech] / 1e6,
+         "LCOE contribution ($/MWh)": econ["lcoe_contribution_by_technology"][tech]}
+        for tech in ["pv", "wind", "otec", "bess"]
+        if econ["cost_by_technology"][tech] > 0
     ]
-    st.dataframe(pd.DataFrame(comp_rows, columns=["", "HOMER method", "Cash-flow method"]),
-                 use_container_width=True, hide_index=True)
+    contrib_rows.append({
+        "Technology": "Total", "Lifecycle cost ($M)": econ["npv_cost"] / 1e6,
+        "LCOE contribution ($/MWh)": econ["lcoe_per_mwh"],
+    })
+    st.caption("Per-technology LCOE contribution — each technology's own discounted lifecycle cost "
+               "(CAPEX + discounted O&M) divided by the system's total discounted energy, so the "
+               "rows sum to the total LCOE above.")
+    st.dataframe(pd.DataFrame(contrib_rows).round(2), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.subheader("Grid search transparency")
@@ -507,7 +505,7 @@ if st.session_state.get("bb_done"):
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         traj_df.to_excel(writer, sheet_name="Trajectory", index=False)
         pd.DataFrame(log_rows).to_excel(writer, sheet_name="Tranche_Decisions", index=False)
-        pd.DataFrame(comp_rows, columns=["Metric", "HOMER", "Cash-flow"]).to_excel(writer, sheet_name="Economics", index=False)
+        pd.DataFrame(contrib_rows).round(2).to_excel(writer, sheet_name="Economics", index=False)
         if not trials_df.empty:
             trials_df.rename(columns=display_trial_cols)[list(display_trial_cols.values())].to_excel(
                 writer, sheet_name="Grid_Search_Detail", index=False)
