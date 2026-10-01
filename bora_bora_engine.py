@@ -389,10 +389,6 @@ def crf(rate, lifetime_yr):
     return (rate * (1 + rate) ** lifetime_yr) / ((1 + rate) ** lifetime_yr - 1)
 
 
-def real_discount_rate(nominal, inflation):
-    return (nominal - inflation) / (1 + inflation)
-
-
 def _tranche_capex(t: Tranche, unit_costs):
     if t.technology == "pv":
         return t.capacity_mw * unit_costs["pv_capex_per_mwp"]
@@ -417,30 +413,29 @@ def _tranche_om_per_year(t: Tranche, unit_costs):
     return 0.0
 
 
-def _tranche_lifetime(t: Tranche, lifetimes):
-    return lifetimes[t.technology]
-
-
 def compute_lifecycle_economics(
-    schedule: TrancheSchedule, traj_df, unit_costs, lifetimes,
+    schedule: TrancheSchedule, traj_df, unit_costs,
     nominal_discount_rate, inflation_rate,
     analysis_start_year, analysis_end_year,
-    method,  # "homer" or "cashflow"
 ):
     """Builds a year-by-year system cash flow from analysis_start_year to
-    analysis_end_year (inclusive) across ALL tranches, discounts it, and
-    returns total NPC and LCOE.
+    analysis_end_year (inclusive) across ALL tranches, discounts it at the
+    nominal discount rate, and returns total NPC and LCOE.
 
-    method="cashflow": nominal discount rate; O&M escalates with inflation;
-      no replacement modeled (CAPEX only at each tranche's own commissioning
-      year); no salvage. Matches NPV(costs)/NPV(energy).
-    method="homer": real discount rate; O&M held constant in real terms;
-      a tranche is replaced (full CAPEX again) every time its own lifetime
-      elapses within the horizon; any tranche with remaining useful life at
-      analysis_end_year gets a prorated salvage credit.
+    CAPEX is booked once, in each tranche's own commissioning year only (no
+    replacement modeled regardless of tranche lifetime); O&M escalates with
+    inflation from analysis_start_year; no salvage credit at the horizon end.
+    LCOE = NPV(costs) / NPV(energy-served), both discounted at the nominal
+    rate - i.e. standard NPV(costs)/NPV(energy).
+
+    This is the project's single LCOE methodology (the former "cash-flow"
+    method), verified against the FDDA reference model (Oct 2026) to be the
+    same formula: CAPEX-only-at-build, inflation-escalated O&M, nominal
+    discounting throughout, discounted-energy denominator. The former
+    "HOMER-style" alternative (real discount rate + per-tranche replacement
+    + prorated salvage) has been removed; this is the sole method now.
     """
-    rate = (real_discount_rate(nominal_discount_rate, inflation_rate)
-            if method == "homer" else nominal_discount_rate)
+    rate = nominal_discount_rate
 
     energy_by_year = {int(row["year"]): row["total_served_mwh"] for _, row in traj_df.iterrows()}
 
@@ -451,6 +446,7 @@ def compute_lifecycle_economics(
 
     for year in years:
         t_idx = year - analysis_start_year
+        discount_factor = (1 + rate) ** t_idx
         year_cost = 0.0
 
         for t in schedule.all_tranches():
@@ -458,46 +454,33 @@ def compute_lifecycle_economics(
                 continue
             capex = _tranche_capex(t, unit_costs)
             om_base = _tranche_om_per_year(t, unit_costs)
-            lifetime = _tranche_lifetime(t, lifetimes)
-            age = year - t.commissioning_year
 
             tech_cost = 0.0
             if year == t.commissioning_year:
                 tech_cost += capex
-            if method == "cashflow":
-                tech_cost += om_base * (1 + inflation_rate) ** t_idx
-            else:  # homer
-                tech_cost += om_base  # constant real terms
-                if age > 0 and lifetime > 0 and age % lifetime == 0 and year != t.commissioning_year:
-                    tech_cost += capex  # replacement event
+            tech_cost += om_base * (1 + inflation_rate) ** t_idx
 
             year_cost += tech_cost
-            cost_by_tech[t.technology] += tech_cost / (1 + rate) ** t_idx
+            cost_by_tech[t.technology] += tech_cost / discount_factor
 
-        # HOMER-style salvage credit at the horizon end
-        if method == "homer" and year == analysis_end_year:
-            for t in schedule.all_tranches():
-                if year < t.commissioning_year:
-                    continue
-                lifetime = _tranche_lifetime(t, lifetimes)
-                age = year - t.commissioning_year
-                remaining_frac = 1 - (age % lifetime) / lifetime if lifetime > 0 else 0
-                salvage = _tranche_capex(t, unit_costs) * remaining_frac
-                year_cost -= salvage
-                cost_by_tech[t.technology] -= salvage / (1 + rate) ** t_idx
-
-        discount_factor = (1 + rate) ** t_idx
         npv_cost += year_cost / discount_factor
         npv_energy += energy_by_year.get(year, 0.0) / discount_factor
 
     lcoe_per_mwh = (npv_cost / npv_energy) if npv_energy > 0 else 0.0
+    # Per-technology LCOE contribution: each tech's own discounted lifecycle
+    # cost (CAPEX + discounted O&M) divided by the SYSTEM's total discounted
+    # energy, so the contributions are additive and sum to lcoe_per_mwh.
+    lcoe_contribution_by_technology = {
+        tech: (cost / npv_energy if npv_energy > 0 else 0.0)
+        for tech, cost in cost_by_tech.items()
+    }
 
     return {
-        "method": method,
         "npv_cost": npv_cost,
         "npv_energy_mwh": npv_energy,
         "lcoe_per_mwh": lcoe_per_mwh,
         "cost_by_technology": cost_by_tech,
+        "lcoe_contribution_by_technology": lcoe_contribution_by_technology,
     }
 
 
