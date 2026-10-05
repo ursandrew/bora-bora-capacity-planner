@@ -80,6 +80,11 @@ LCOE = NPC / NPV of **project-served** energy (same discounting).
   energy) is estimated per hour and subtracted from total served energy.
 - The "Year-by-year cash flow" table and the `LCOE_Cashflow` export sheet show every
   term so the result can be reconciled against a spreadsheet.
+- **"Download LCOE verification workbook"** (Economics section) generates Inputs,
+  Tranche_Schedule, Trajectory and Hybrid_LCOE sheets for the run with LIVE Excel
+  formulas (SUMIFS over the tranche table, replacement years, CAPEX escalation switch,
+  per-technology LCOE contributions). The sheet's LCOE equals the app's; edit an input
+  there to test a sensitivity. Insert new tranche rows inside the Tranche_Schedule table.
 - Sizing ranks feasible candidates by their own **NPC** (escalated CAPEX +
   replacements + escalated O&M, discounted), not day-one CAPEX. It is still greedy
   year by year - each tranche year is optimised given the earlier ones, not jointly.
@@ -124,4 +129,5 @@ streamlit run bora_bora_app.py
   and replacement), `simulate_year()` hourly dispatch, `simulate_trajectory()`,
   cash-flow NPC/LCOE, `compliance_table()`, `size_tranche_schedule()` sequential
   NPC-ranked grid search.
+- `bora_bora_export.py` - builds the formula-driven LCOE verification workbook.
 - `bora_bora_app.py` - Streamlit UI.
