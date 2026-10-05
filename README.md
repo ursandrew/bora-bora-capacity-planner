@@ -71,8 +71,10 @@ LCOE = NPC / NPV of **project-served** energy (same discounting).
   20-year life is replaced in 2049; with 22 years there is no replacement inside a
   2050 horizon. Untick the option to run everything to the horizon with no
   replacement. No salvage credit at the horizon end.
-- OTEC CAPEX per tranche = fixed + $/MW x MW (default fixed 0, $24.23M/MW =
-  $63M / 2.6 MW). Replace with a two-point fit once both figures are confirmed.
+- OTEC CAPEX per tranche = fixed + $/MW x MW (default fixed 0, $63.14M/MW =
+  EUR152M x 1.08 / 2.6 MW, the high anchor of the 2H Offshore study). That default is exact
+  for a single 2.6 MW tranche only; a staged or smaller OTEC schedule needs a two-point
+  fixed + variable fit once both anchors (and their capacities) are confirmed.
 - **Rooftop is excluded from the LCOE denominator** (privately owned, not in the
   numerator). Its delivered energy (direct + its pro-rata share of BESS-stored
   energy) is estimated per hour and subtracted from total served energy.
