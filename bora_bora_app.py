@@ -15,6 +15,7 @@ from io import BytesIO
 
 import bora_bora_data as data
 import bora_bora_engine as eng
+import bora_bora_export
 
 st.set_page_config(page_title="Bora Bora Net Zero Optimization", layout="wide")
 
@@ -405,6 +406,13 @@ if run_button:
 
     st.session_state.update(bb_schedule=schedule, bb_log=log, bb_traj_df=traj_df, bb_trials=trials,
                              bb_econ=econ, bb_compliance_df=compliance_df, bb_input_warnings=input_warnings,
+                             bb_export_inputs=dict(
+                                 unit_costs=unit_costs, nominal_discount_rate=nominal_discount_rate_pct / 100,
+                                 inflation_rate=inflation_rate_pct / 100, start_year=analysis_start_year,
+                                 end_year=int(analysis_end_year), escalate_capex=escalate_capex,
+                                 lifetimes=dict(lifetimes, otec=otec_life),
+                                 degradation=dict(pv=pv_degradation_pct / 100, bess=bess_degradation_pct / 100,
+                                                  wind=wind_degradation_pct / 100, otec=otec_degradation_pct / 100)),
                              bb_econ_flags=dict(escalate_capex=escalate_capex, replacement_enabled=replacement_enabled,
                                                 inflation_pct=inflation_rate_pct, discount_pct=nominal_discount_rate_pct,
                                                 lifetimes=dict(lifetimes, otec=otec_life)),
@@ -569,6 +577,21 @@ if st.session_state.get("bb_done"):
         st.caption("Nominal $ per year by technology, the discount factor, and the discounted cost and energy "
                    "that make up NPC and LCOE. LCOE = sum of 'PV of cost' / sum of 'PV of energy'.")
         st.dataframe(cashflow_df.round(2), use_container_width=True, hide_index=True)
+
+    exp_in = st.session_state["bb_export_inputs"]
+    try:
+        lcoe_xlsx = bora_bora_export.build_lcoe_workbook(
+            schedule, traj_df, exp_in["unit_costs"], exp_in["nominal_discount_rate"], exp_in["inflation_rate"],
+            exp_in["start_year"], exp_in["end_year"], exp_in["escalate_capex"], exp_in["lifetimes"],
+            exp_in["degradation"], econ["lcoe_per_mwh"], econ["npv_cost"])
+        st.download_button(
+            "Download LCOE verification workbook (Excel, live formulas)", data=lcoe_xlsx,
+            file_name="bora_bora_lcoe_verification.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Inputs, Tranche_Schedule, Trajectory and Hybrid_LCOE sheets for THIS run, with working Excel "
+                 "formulas. The sheet's LCOE equals the app's; change an input there to test a sensitivity.")
+    except Exception as e:  # never let the export break the results page
+        st.warning(f"LCOE verification workbook could not be built: {e}")
 
     st.markdown("---")
     st.subheader("Grid search transparency")
