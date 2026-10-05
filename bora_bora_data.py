@@ -268,7 +268,9 @@ def collect_input_warnings(pv_cf=None, wind_cf=None, baseline_shape=None,
     for label, series in (("PV", pv_cf), ("Wind", wind_cf)):
         if series is not None and max(series) > 1.0:
             warns.append(f"{label} capacity-factor profile has values above 1.0 (max {max(series):.3f}). "
-                         f"Check it is a fraction of nameplate, not a different normalisation.")
+                         f"This is fine if it is MW per 1 MWac block of a DC-oversized plant (e.g. PVsyst E_Grid for "
+                         f"1.3 MWp / 1 MWac, which can exceed 1.0 on clear hours); the model divides MWp by the "
+                         f"DC:AC ratio first. Otherwise check it is not a different normalisation.")
 
     if baseline_shape is not None:
         total = sum(baseline_shape)
