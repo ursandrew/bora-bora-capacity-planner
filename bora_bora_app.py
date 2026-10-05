@@ -95,12 +95,8 @@ with st.sidebar:
         otec_enabled = st.checkbox("Include OTEC", value=True)
         otec_schedule_str = st.text_input(
             "OTEC schedule (format 'year:mw', comma-separated - each entry is its own vintage tranche)",
-            "2032:1.2", disabled=not otec_enabled)
-        st.caption("Each 'year:mw' entry commissions that much ADDITIONAL OTEC capacity in that year, stacking on "
-                   "top of whatever OTEC is already online (own vintage/degradation clock, same as PV/BESS "
-                   "tranches). Example: '2032:1.2, 2037:1.4, 2042:1.2, 2047:1.2' stages OTEC across four "
-                   "milestones instead of one fixed build - independent of the PV/BESS tranche years below, so "
-                   "you can lean on staged OTEC without re-sizing PV/BESS at those same years.")
+            "2032:2.6", disabled=not otec_enabled)
+
         otec_cf = st.number_input("Capacity factor (applies to every OTEC tranche)", value=1.0, min_value=0.0, max_value=1.0, step=0.01, disabled=not otec_enabled)
         otec_degradation_pct = st.number_input("Degradation rate (%/yr, applies to every OTEC tranche)", value=0.0, step=0.1, disabled=not otec_enabled)
 
@@ -209,8 +205,8 @@ with st.sidebar:
 
         st.markdown("**PV**")
         c1, c2 = st.columns(2)
-        pv_capex_per_mwp = c1.number_input("CAPEX ($/MWp)", value=900_000, step=50_000, key="pv_capex")
-        pv_om_per_mwp_yr = c2.number_input("O&M ($/MWp/yr)", value=12_000, step=1_000, key="pv_om")
+        pv_capex_per_mwp = c1.number_input("CAPEX ($/MWp)", value=2_500_000, step=50_000, key="pv_capex")
+        pv_om_per_mwp_yr = c2.number_input("O&M ($/MWp/yr)", value=50_000, step=1_000, key="pv_om")
         pv_lifetime = st.number_input("Lifetime (years)", value=25, step=1, key="pv_life")
 
         st.markdown("**Wind**")
