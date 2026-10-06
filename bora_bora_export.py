@@ -47,7 +47,7 @@ def _head(ws, row, labels, col0=1):
 
 def build_lcoe_workbook(schedule, traj_df, unit_costs, nominal_discount_rate, inflation_rate,
                         analysis_start_year, analysis_end_year, escalate_capex, lifetimes,
-                        degradation, app_lcoe, app_npv_cost):
+                        degradation, app_lcoe, app_npv_cost, construction_lead_years=0):
     """Returns the workbook as bytes.
 
     schedule      TrancheSchedule from the run
@@ -79,15 +79,16 @@ def build_lcoe_workbook(schedule, traj_df, unit_costs, nominal_discount_rate, in
     wi["A2"].font = NOTE_FONT
     rows = [("Analysis start year", analysis_start_year), ("Analysis end year", analysis_end_year),
             ("Nominal discount rate (%)", nominal_discount_rate * 100), ("Inflation rate (%)", inflation_rate * 100),
-            ("Escalate CAPEX with inflation (1=yes, 0=no)", 1 if escalate_capex else 0)]
+            ("Escalate CAPEX with inflation (1=yes, 0=no)", 1 if escalate_capex else 0),
+            ("Construction lead (years): CAPEX booked this many years before commissioning", int(construction_lead_years))]
     for i, (label, val) in enumerate(rows):
         wi.cell(4 + i, 1, label)
         c = wi.cell(4 + i, 2, val)
         c.fill = INPUT_FILL
     ref = {"start": "Inputs!$B$4", "end": "Inputs!$B$5", "disc": "Inputs!$B$6", "infl": "Inputs!$B$7",
-           "esc": "Inputs!$B$8"}
+           "esc": "Inputs!$B$8", "lead": "Inputs!$B$9"}
 
-    row = 10
+    row = 11
     for tech in techs:
         wi.cell(row, 1, f"{TECH_LABEL[tech]} properties").font = BOLD
         row += 1
@@ -178,8 +179,9 @@ def build_lcoe_workbook(schedule, traj_df, unit_costs, nominal_discount_rate, in
     wh = wb.create_sheet("Hybrid_LCOE")
     wh["A1"] = "Bora Bora Hybrid LCOE - cash-flow method (live formulas)"
     wh["A1"].font = Font(bold=True, size=13)
-    wh["A2"] = ("CAPEX is booked in each tranche's commissioning year and again in each replacement year (commissioning + "
-                "lifetime + 1); CAPEX is escalated at the inflation rate when the Inputs switch is 1, O&M always is. "
+    wh["A2"] = ("CAPEX is booked 'Construction lead' years BEFORE each commissioning year (default 1: a 2028 tranche "
+                "spends its CAPEX in 2027) and again before each replacement (commissioning + lifetime + 1); O&M starts "
+                "in the commissioning year; CAPEX is escalated at the inflation rate when the Inputs switch is 1, O&M always is. "
                 "Costs and project-served energy are discounted at the nominal rate to the start year (t=0, DF=1). "
                 "LCOE = NPV(costs) / NPV(energy). No salvage value at the horizon end.")
     wh["A2"].font = NOTE_FONT
@@ -211,11 +213,15 @@ def build_lcoe_workbook(schedule, traj_df, unit_costs, nominal_discount_rate, in
             lab = TECH_LABEL[tech]
             life_ref = ref[tech]["life"]
             k_max = max(1, -(-span // (ref[tech]["life_val"] + 1)))   # ceil: replacement cycles that can fit
-            yr_terms = [f"$A{r}"] + [f"$A{r}-{k}*({life_ref}+1)" for k in range(1, k_max + 1)]
-            cap_terms = "+".join(cap_sum(lab, y) for y in yr_terms)
+            # CAPEX is spent `lead` years before each commissioning (initial build + replacements). In the
+            # first model year the base term also sweeps in builds whose spend would fall before the start.
+            base_year = f"$A{r}+{ref['lead']}"
+            yr_terms = [base_year] + [f"$A{r}+{ref['lead']}-{k}*({life_ref}+1)" for k in range(1, k_max + 1)]
+            yr_crit = [('"<="&(' + y + ')') if (i == 0 and y == base_year) else y for y in yr_terms]
+            cap_terms = "+".join(cap_sum(lab, y) for y in yr_crit)
             expr = f"({cap_terms})*{ref[tech]['capex']}"
             if tech == "otec":
-                cnt_terms = "+".join(cnt(lab, y) for y in yr_terms)
+                cnt_terms = "+".join(cnt(lab, y) for y in yr_crit)
                 expr += f"+({cnt_terms})*{ref[tech]['fixed']}"
             wh.cell(r, capex_cols[tech], f"=({expr})*IF({ref['esc']}=1,$D{r},1)")
             wh.cell(r, om_cols[tech],
