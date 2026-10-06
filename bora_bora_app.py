@@ -184,6 +184,11 @@ with st.sidebar:
                    "buffer above. Example: '2028:78' forces the 2028 sizing search to hit 78% RE at 2028 "
                    "without changing what's required at 2030/2040/2050.")
 
+        fixed_str = st.text_input(
+            "Fixed additions per tranche year (optional, format 'year:PV_MWp:BESS_MWh', comma-separated)", "")
+        st.caption("Pins the size built at that year (no search). Example: '2028:28:88' builds 28 MWp PV + 88 MWh BESS "
+                   "in 2028 even if it misses the RE target; later tranche years are still searched around it.")
+
     # --- Search grid ---------------------------------------------
     with st.expander("🔍 Sizing search grid", expanded=False):
         pv_max = st.number_input("Max PV addition per tranche (MWp)", value=100, step=10)
@@ -202,6 +207,12 @@ with st.sidebar:
                  "build in year Y costs unit CAPEX x (1+inflation)^(Y-2026) - the same escalation O&M already "
                  "gets - before being discounted at the nominal rate. Untick to treat unit CAPEX as the "
                  "expected price at the time of each build (e.g. if you have already priced in cost declines).")
+        construction_lead_years = st.number_input(
+            "Construction lead (years): CAPEX is spent this many years BEFORE commissioning", value=1, min_value=0,
+            max_value=5, step=1,
+            help="A tranche commissioned in 2028 with lead 1 books its CAPEX in 2027; O&M and the dispatch/"
+                 "trajectory stay on the commissioning year (2028). Replacements move the same way. 0 = CAPEX "
+                 "in the commissioning year (old behaviour). CAPEX is never booked before 2026.")
         replacement_enabled = st.checkbox(
             "Model end-of-life replacement inside the horizon", value=True,
             help="An asset is in service from its commissioning year through (commissioning year + lifetime), "
@@ -211,8 +222,8 @@ with st.sidebar:
 
         st.markdown("**PV**")
         c1, c2 = st.columns(2)
-        pv_capex_per_mwp = c1.number_input("CAPEX ($/MWp)", value=900_000, step=50_000, key="pv_capex")
-        pv_om_per_mwp_yr = c2.number_input("O&M ($/MWp/yr)", value=12_000, step=1_000, key="pv_om")
+        pv_capex_per_mwp = c1.number_input("CAPEX ($/MWp)", value=1_200_000, step=50_000, key="pv_capex")
+        pv_om_per_mwp_yr = c2.number_input("O&M ($/MWp/yr)", value=20_000, step=1_000, key="pv_om")
         pv_lifetime = st.number_input("Lifetime (years)", value=25, step=1, key="pv_life")
 
         st.markdown("**Wind**")
@@ -237,9 +248,9 @@ with st.sidebar:
 
         st.markdown("**BESS**")
         c1, c2 = st.columns(2)
-        bess_capex_per_mwh = c1.number_input("CAPEX ($/MWh)", value=350_000, step=25_000, key="bess_capex")
-        bess_om_per_mwh_yr = c2.number_input("O&M ($/MWh/yr)", value=7_000, step=500, key="bess_om")
-        bess_lifetime = st.number_input("Lifetime (years)", value=20, step=1, key="bess_life")
+        bess_capex_per_mwh = c1.number_input("CAPEX ($/MWh installed)", value=100_000, step=25_000, key="bess_capex")
+        bess_om_per_mwh_yr = c2.number_input("O&M ($/MWh/yr)", value=500, step=100, key="bess_om")
+        bess_lifetime = st.number_input("Lifetime (years; 999 = no replacement in the horizon)", value=999, step=1, key="bess_life")
 
     run_button = st.button("🚀 Run", type="primary", use_container_width=True)
 
@@ -283,6 +294,19 @@ if run_button:
         st.stop()
 
     wind_optimize = wind_enabled and wind_sizing_mode == "Optimize capacity"
+
+    fixed_additions = {}
+    for pair in fixed_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        try:
+            assert len(parts) in (3, 4)
+            fixed_additions[int(parts[0])] = tuple(float(x) for x in parts[1:])
+        except (ValueError, AssertionError):
+            st.error(f"Fixed addition '{pair}' isn't in 'year:PV_MWp:BESS_MWh' format.")
+            st.stop()
 
     target_overrides = {}
     for pair in target_overrides_str.split(","):
@@ -368,6 +392,7 @@ if run_button:
     econ_params = dict(
         nominal_discount_rate=nominal_discount_rate_pct / 100, inflation_rate=inflation_rate_pct / 100,
         analysis_end_year=int(analysis_end_year), escalate_capex=escalate_capex,
+        construction_lead_years=int(construction_lead_years),
     )
     analysis_start_year = 2026
 
@@ -388,6 +413,7 @@ if run_button:
             unit_costs=unit_costs, econ=econ_params,
             exogenous_tranches=exogenous_tranches,
             target_overrides=target_overrides,
+            fixed_additions=fixed_additions,
             wind_candidates_mw=wind_candidates,
             wind_degradation_rate=wind_degradation_pct / 100 if wind_enabled else 0.0,
             lifetimes=lifetimes,
@@ -402,6 +428,7 @@ if run_button:
             schedule, traj_df, unit_costs,
             nominal_discount_rate_pct / 100, inflation_rate_pct / 100,
             analysis_start_year, int(analysis_end_year), escalate_capex=escalate_capex,
+            construction_lead_years=int(construction_lead_years),
         )
         compliance_df = pd.DataFrame(eng.compliance_table(traj_df, re_target_2030_pct / 100, re_target_2050_pct / 100))
 
@@ -411,6 +438,7 @@ if run_button:
                                  unit_costs=unit_costs, nominal_discount_rate=nominal_discount_rate_pct / 100,
                                  inflation_rate=inflation_rate_pct / 100, start_year=analysis_start_year,
                                  end_year=int(analysis_end_year), escalate_capex=escalate_capex,
+                                 construction_lead_years=int(construction_lead_years),
                                  lifetimes=dict(lifetimes, otec=otec_life),
                                  degradation=dict(pv=pv_degradation_pct / 100, bess=bess_degradation_pct / 100,
                                                   wind=wind_degradation_pct / 100, otec=otec_degradation_pct / 100)),
@@ -456,10 +484,10 @@ if st.session_state.get("bb_done"):
         "Tranche Year": l["year"], "PV Added (MWp)": l["pv_add"], "BESS Added (MWh)": l["bess_add_mwh"],
         "Wind Added (MW)": l.get("wind_add", 0),
         "RE% at Commissioning": f"{l['re_pct']:.1f}%",
-        "Target": f"{l['required_pct']:.1f}%" + (" (override)" if l.get("override") else " (glide+buffer)"),
+        "Target": f"{l['required_pct']:.1f}%" + (" (override)" if l.get("override") else " (glide+buffer)") + (" - FIXED size" if l.get("status") == "FIXED" else ""),
         "Curtailment %": f"{l['curtailment_pct']:.1f}%",
         "Addition NPC ($M)": round(l["cost_proxy"] / 1e6, 2),
-    } for l in log if l.get("status") == "OK"]
+    } for l in log if l.get("status") in ("OK", "FIXED")]
     if log_rows:
         st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
 
@@ -584,7 +612,8 @@ if st.session_state.get("bb_done"):
         lcoe_xlsx = bora_bora_export.build_lcoe_workbook(
             schedule, traj_df, exp_in["unit_costs"], exp_in["nominal_discount_rate"], exp_in["inflation_rate"],
             exp_in["start_year"], exp_in["end_year"], exp_in["escalate_capex"], exp_in["lifetimes"],
-            exp_in["degradation"], econ["lcoe_per_mwh"], econ["npv_cost"])
+            exp_in["degradation"], econ["lcoe_per_mwh"], econ["npv_cost"],
+            construction_lead_years=exp_in.get("construction_lead_years", 0))
         st.download_button(
             "Download LCOE verification workbook (Excel, live formulas)", data=lcoe_xlsx,
             file_name="bora_bora_lcoe_verification.xlsx",
@@ -629,7 +658,7 @@ if st.session_state.get("bb_done"):
             "npc_add": "NPC of addition ($)", "lcoe_proxy_per_mwh": "LCOE proxy ($/MWh)",
             "re_pct": "RE% Achieved", "unmet_pct": "Unmet %", "curtailment_pct": "Curtailment %",
             "required_pct": "Required RE% (target+buffer/override)",
-            "re_target_met": "RE Target Met?", "unmet_ceiling_met": "Unmet Ceiling Met?",
+            "re_target_met": "RE Target Met?",
             "curtailment_cap_met": "Curtailment Cap Met?", "feasible": "Feasible?", "selected": "Selected (chosen)?",
         }
         pretty = view_df.rename(columns=display_trial_cols)[list(display_trial_cols.values())].round(2)
