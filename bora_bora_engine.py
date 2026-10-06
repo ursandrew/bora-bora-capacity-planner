@@ -158,7 +158,9 @@ def simulate_year(
 
     Rooftop (if enabled) contributes ONLY its exported-to-grid share
     (1 - rooftop_self_consumption_pct) of its generation, using the same
-    hourly CF shape as pv_cf_hourly - the self-consumed share is already
+    hourly profile as pv_cf_hourly (rooftop MWp is divided by dc_ac_ratio
+    first, exactly like the agrivoltaic PV, because that profile is MW per
+    1 MWac block) - the self-consumed share is already
     netted out of `underlying_annual_table` upstream (Forecast_Annual's
     "net of rooftop solar" row), so adding it again here would double-count
     it. This mirrors the workbook's own Row 12/14 "exported to grid" split.
@@ -198,7 +200,12 @@ def simulate_year(
     if rooftop_enabled:
         rooftop_mwp = rooftop_capacity_mwp(year, rooftop_existing_mwp, rooftop_ceiling_mwp,
                                             rooftop_ramp_start_year, rooftop_ramp_mwp_per_year)
-        rooftop_gen_raw = rooftop_mwp * pv_cf  # same solar CF shape as Agri PV
+        # pv_cf_hourly is MW per 1 MWac block of a DC-oversized plant (e.g. PVsyst 1.3 MWp / 1 MWac), and
+        # rooftop capacity is entered in MWp (DC). So rooftop MWp is divided by the same DC:AC ratio as the
+        # agrivoltaic PV (pv_mwac above) before the profile is applied; otherwise each rooftop MWp would
+        # produce dc_ac_ratio times more energy than each agrivoltaic MWp.
+        rooftop_mwac_equiv = rooftop_mwp / dc_ac_ratio if dc_ac_ratio else rooftop_mwp
+        rooftop_gen_raw = rooftop_mwac_equiv * pv_cf
         rooftop_gen_exported = rooftop_gen_raw * (1 - rooftop_self_consumption_pct)
     else:
         rooftop_mwp = 0.0
