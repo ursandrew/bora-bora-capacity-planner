@@ -107,8 +107,11 @@ disagreeing with its annual MWh, annual demand table outside 10,000-200,000 MWh.
 
 - **PV, wind and BESS CAPEX/O&M defaults are placeholders**; replace with validated
   client/EDT figures. OTEC CAPEX and O&M need a citable source.
-- Rooftop uses the same hourly CF shape as the agrivoltaic PV (workbook used a lower
-  CF for rooftop); only the 7% exported share enters, so the effect is small.
+- Rooftop uses the same hourly profile as the agrivoltaic PV, with its MWp divided by the
+  DC:AC ratio first (about 1,800 kWh/kWp, in line with the workbook's existing-rooftop
+  CF 0.2033). The workbook's lower CF for NEW rooftop (0.1777) and its 0.3%/yr rooftop
+  degradation are not modelled; only the 7% exported share enters, so the gap is small
+  (roughly 90 MWh/yr by 2050).
 - Curtailment will not exactly match Excel: this is a from-scratch physical merit-order
   simulation; cross-check before quoting either number externally.
 - The 2030/2050 milestone years are hardcoded in the glide-path and compliance logic.
