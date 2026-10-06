@@ -52,7 +52,8 @@ with st.sidebar:
         rooftop_enabled = st.checkbox("Include rooftop (exported-to-grid share only)", value=True)
         st.caption("The self-consumed share is already netted out of your Underlying annual demand table "
                    "(Forecast_Annual's 'net of rooftop solar' row) - adding it again here would double-count it. "
-                   "Only the exported share below is added as generation. Uses the same hourly CF shape as Agri PV.")
+                   "Only the exported share below is added as generation. Uses the same hourly profile and DC:AC "
+                   "ratio as Agri PV (capacity is entered in MWp).")
         rooftop_existing_mwp = st.number_input("Existing capacity (MWp)", value=2.357, step=0.1, disabled=not rooftop_enabled)
         rooftop_ceiling_mwp = st.number_input("Ceiling capacity (MWp)", value=4.5, step=0.1, disabled=not rooftop_enabled)
         rooftop_ramp_start_year = st.number_input(
