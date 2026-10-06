@@ -519,33 +519,42 @@ def _tranche_om_per_year(t: Tranche, unit_costs):
     return 0.0
 
 
-def tranche_cashflows(t: Tranche, unit_costs, inflation_rate, start_year, end_year, escalate_capex=True):
-    """Nominal cash flows of one tranche from max(commissioning, start_year) to end_year, as a list of
-    (year, capex, om). Unit costs are taken to be in `start_year` dollars:
-      - CAPEX is booked in the commissioning year and again in every replacement year within the
-        horizon (see Tranche.lifetime_years), escalated by (1+inflation)^(year-start_year) when
-        escalate_capex is True, otherwise held at the flat start-year price;
-      - O&M is booked every year from commissioning, escalated by inflation from start_year.
-    No salvage credit at the horizon end."""
+def tranche_cashflows(t: Tranche, unit_costs, inflation_rate, start_year, end_year, escalate_capex=True,
+                      construction_lead_years=0):
+    """Nominal cash flows of one tranche as a list of (year, capex, om). Unit costs are taken to be in
+    `start_year` dollars:
+      - CAPEX for each build (the commissioning build and every replacement inside the horizon, see
+        Tranche.lifetime_years) is booked `construction_lead_years` BEFORE the year the asset is
+        commissioned (1 = spent the year before COD), never earlier than start_year, escalated by
+        (1+inflation)^(year spent - start_year) when escalate_capex is True, otherwise flat start-year price;
+      - O&M is booked every year from the COMMISSIONING year, escalated by inflation from start_year.
+    No salvage credit at the horizon end. The dispatch/trajectory always uses the commissioning year;
+    the lead only moves when the CAPEX cash is spent."""
     base_capex = _tranche_capex(t, unit_costs)
     base_om = _tranche_om_per_year(t, unit_costs)
-    build_years = set(t.build_years(end_year))
+    lead = max(0, int(construction_lead_years or 0))
+    capex_by_year = {}
+    for b in t.build_years(end_year):
+        if b < start_year:
+            continue                       # already-built asset: no new CAPEX
+        cy = max(b - lead, start_year)
+        capex_by_year[cy] = capex_by_year.get(cy, 0.0) + base_capex
+    years = sorted(set(range(max(t.commissioning_year, start_year), end_year + 1)) | set(capex_by_year))
     flows = []
-    for year in range(max(t.commissioning_year, start_year), end_year + 1):
+    for year in years:
         idx = year - start_year
-        capex = 0.0
-        if year in build_years:
-            capex = base_capex * ((1 + inflation_rate) ** idx if escalate_capex else 1.0)
-        om = base_om * (1 + inflation_rate) ** idx
+        capex = capex_by_year.get(year, 0.0) * ((1 + inflation_rate) ** idx if escalate_capex else 1.0)
+        om = base_om * (1 + inflation_rate) ** idx if year >= t.commissioning_year else 0.0
         flows.append((year, capex, om))
     return flows
 
 
 def tranche_npv(t: Tranche, unit_costs, nominal_discount_rate, inflation_rate, start_year, end_year,
-                escalate_capex=True):
+                escalate_capex=True, construction_lead_years=0):
     """Lifecycle NPV of cost (CAPEX + replacements + O&M) of one tranche, discounted to start_year."""
     total = 0.0
-    for year, capex, om in tranche_cashflows(t, unit_costs, inflation_rate, start_year, end_year, escalate_capex):
+    for year, capex, om in tranche_cashflows(t, unit_costs, inflation_rate, start_year, end_year, escalate_capex,
+                                              construction_lead_years):
         total += (capex + om) / (1 + nominal_discount_rate) ** (year - start_year)
     return total
 
@@ -554,7 +563,7 @@ def compute_lifecycle_economics(
     schedule: TrancheSchedule, traj_df, unit_costs,
     nominal_discount_rate, inflation_rate,
     analysis_start_year, analysis_end_year,
-    escalate_capex=True,
+    escalate_capex=True, construction_lead_years=0,
 ):
     """Builds a year-by-year system cash flow from analysis_start_year to
     analysis_end_year (inclusive) across ALL tranches, discounts it at the
@@ -585,7 +594,7 @@ def compute_lifecycle_economics(
 
     for t in schedule.all_tranches():
         for year, capex, om in tranche_cashflows(t, unit_costs, inflation_rate, analysis_start_year,
-                                                  analysis_end_year, escalate_capex):
+                                                  analysis_end_year, escalate_capex, construction_lead_years):
             capex_by_year[year][t.technology] += capex
             om_by_year[year][t.technology] += om
 
@@ -700,10 +709,13 @@ def size_tranche_schedule(
     unit_costs,           # per-technology CAPEX / O&M (see _tranche_capex / _tranche_om_per_year)
     econ,                 # dict: nominal_discount_rate, inflation_rate, analysis_end_year, escalate_capex
     exogenous_tranches=None,   # list of Tranche objects to seed the schedule with (OTEC, Wind if enabled)
-    unmet_load_ceiling_pct=100.0,
     target_overrides=None,   # optional {year: required_pct} - pins an exact required RE% at that
                               # tranche year, bypassing the glide-path+buffer calculation for that
                               # year only; every other tranche year is unaffected.
+    fixed_additions=None,    # optional {year: (pv_mwp, bess_mwh[, wind_mw])} - HARD-PINS the addition built at
+                              # that tranche year (no search). The pinned tranche is locked in even if it
+                              # misses the RE target / curtailment cap (log status 'FIXED'; the trial row
+                              # still shows which gates it passed). Other tranche years are searched as usual.
     wind_candidates_mw=None,      # None/[] -> wind is not optimized (any wind capacity must be
                                    # passed in via exogenous_tranches instead, as a fixed input).
                                    # Otherwise wind is searched at EVERY tranche year, exactly like
@@ -753,6 +765,7 @@ def size_tranche_schedule(
     infl = econ["inflation_rate"]
     end_year = int(econ["analysis_end_year"])
     escalate = econ.get("escalate_capex", True)
+    lead_yrs = int(econ.get("construction_lead_years", 0))
 
     schedule = TrancheSchedule()
     for t in (exogenous_tranches or []):
@@ -761,6 +774,7 @@ def size_tranche_schedule(
     log = []
     trials = []
     target_overrides = target_overrides or {}
+    fixed_additions = {int(k): tuple(v) for k, v in (fixed_additions or {}).items()}
     wind_candidates_mw = wind_candidates_mw or []
     iteration = 0
 
@@ -789,7 +803,7 @@ def size_tranche_schedule(
             else:
                 u = Tranche("bess", ty, bess_degradation_rate, power_mw=bess_c_rate, energy_mwh=1.0,
                             lifetime_years=lifetimes.get("bess"))
-            return tranche_npv(u, unit_costs, rate, infl, analysis_start_year, end_year, escalate)
+            return tranche_npv(u, unit_costs, rate, infl, analysis_start_year, end_year, escalate, lead_yrs)
 
         pv_unit_npc, bess_unit_npc, wind_unit_npc = _unit_npc("pv"), _unit_npc("bess"), _unit_npc("wind")
         esc_ty = (1 + infl) ** (ty - analysis_start_year)
@@ -804,8 +818,14 @@ def size_tranche_schedule(
 
         best = None
         best_trial_index = None
-        for pv_add in pv_candidates_mwp:
-            for bess_add_mwh in bess_candidates_mwh:
+        is_fixed = ty in fixed_additions
+        pv_cands_y, bess_cands_y = pv_candidates_mwp, bess_candidates_mwh
+        if is_fixed:
+            fx = fixed_additions[ty]
+            pv_cands_y, bess_cands_y = [fx[0]], [fx[1]]
+            wind_candidates_this_year = [fx[2] if len(fx) > 2 else 0.0]
+        for pv_add in pv_cands_y:
+            for bess_add_mwh in bess_cands_y:
                 for wind_add in wind_candidates_this_year:
                     trial = schedule.clone()
                     if pv_add > 0:
@@ -822,9 +842,8 @@ def size_tranche_schedule(
                     r = simulate_year(ty, trial, initial_soc_mwh=soc_carry, **sim_kwargs)
 
                     re_target_met = r["re_pct"] >= required_pct - RE_TOL_PP
-                    unmet_ceiling_met = r["unmet_pct"] <= unmet_load_ceiling_pct
                     curtailment_cap_met = r["curtailment_pct_of_re_gen"] <= curtailment_cap_pct
-                    feasible = re_target_met and unmet_ceiling_met and curtailment_cap_met
+                    feasible = re_target_met and curtailment_cap_met
 
                     # Candidate economics, all in tranche-year dollars except NPC (discounted to start year)
                     npc_add = pv_add * pv_unit_npc + bess_add_mwh * bess_unit_npc + wind_add * wind_unit_npc
@@ -850,13 +869,12 @@ def size_tranche_schedule(
                             "curtailment_pct": r["curtailment_pct_of_re_gen"],
                             "required_pct": required_pct,
                             "re_target_met": re_target_met,
-                            "unmet_ceiling_met": unmet_ceiling_met,
                             "curtailment_cap_met": curtailment_cap_met,
                             "feasible": feasible,
                             "selected": False,   # back-filled to True on the winning row once known
                         })
 
-                    if not feasible:
+                    if not feasible and not is_fixed:
                         continue
 
                     if best is None or npc_add < best["cost_proxy"]:
@@ -888,7 +906,7 @@ def size_tranche_schedule(
                                           power_mw=best["bess_add_mwh"] * bess_c_rate, energy_mwh=best["bess_add_mwh"],
                                           lifetime_years=lifetimes.get("bess")))
 
-        log.append({"year": ty, "status": "OK", **best, "target_pct": target_pct,
+        log.append({"year": ty, "status": ("FIXED" if is_fixed else "OK"), **best, "target_pct": target_pct,
                     "required_pct": required_pct, "override": is_override})
 
     return schedule, log, trials
